@@ -38,6 +38,42 @@
     <a href="https://github.com/Hon-Lu/OverTranslate/releases/latest/download/OverTranslate-win-Portable.zip"><img src="docs/images/ui/btn-portable.en.svg" alt="Download the portable version" /></a>
   </p>
 
+</div>
+
+---
+
+## ✨ 本 Fork 增强特性（Fork Enhancements）
+
+> **致谢上游**：本项目 Fork 自 [Hon-Lu/OverTranslate](https://github.com/Hon-Lu/OverTranslate)，衷心感谢原作者 Hon-Lu 的开源贡献与精良架构。本仓库在其 MIT 协议基础上，面向**高速实时游戏剧情 / 字幕与低延迟 LLM 翻译**进行了深度增强。  
+> *Enhanced fork of [Hon-Lu/OverTranslate](https://github.com/Hon-Lu/OverTranslate) — featuring DirectML GPU horizontal OCR, Windows OCR & custom ONNX models, configurable polling/throttling, parallel OpenAI segments, subtitle-first priority & history hold, and LLM refusal isolation.*
+
+### 原版 vs 本 Fork 核心对比
+
+| 维度 | 原版 (`Hon-Lu/OverTranslate`) | 本 Fork 增强版 (`maomaohk/OverTranslate`) |
+| :--- | :--- | :--- |
+| **横排 OCR 推理** | 仅 CPU 运行 PP-OCR | 支持 **DirectML GPU 加速**（串行锁保护 + 失败自动回退 CPU，随包自带 `DirectML.dll`），大幅降低游戏 CPU 占用 |
+| **OCR 引擎与模型** | 固定内置 ONNX 模型 | 新增 **Windows 原生 OCR（极低 CPU）**，并支持在设置中切换 **自定义 PP-OCR ONNX 模型目录** |
+| **实时轮询与限流** | 写死 150ms 轮询，无并发/冷却限制 | 高级设置自由配置：**轮询间隔（100~5000ms）**、**API 冷却间隔（0~10000ms）**、**最大并发数（1~8）** |
+| **OpenAI 多段翻译** | 非 Batch 模式下逐段串行等待 | 非 Batch 模式下改为 **4 路并发请求 + 按原序回写**，多段同屏翻译延迟显著降低 |
+| **字幕模式调度与显示** | 统一 OCR 抢槽；新句覆盖旧句；空清屏丢弃迟到译文 | **两级优先级 OCR 抢槽** + **字幕下方累积显示 & 独立延迟消失** + **保住迟到译文** + **全队列标准化/打字机去重** |
+| **大模型安全拒答防护** | 拒答文本直接写入缓存与上下文历史 | **自动识别中英文拒答**，禁止写入缓存与历史并**剥离上下文单独重试**，防止单句敏感词污染后续菜单与台词 |
+
+### 6 大核心升级详情
+
+1. **横排 OCR DirectML GPU 加速**：为横排 PP-OCR ONNX 推理接入显卡 DirectML 加速（内置串行推理锁防止驱动并发冲突，显卡异常时自动回退至 CPU），显著降低高帧率游戏场景下的 CPU 占用，发布包自带 `DirectML.dll`。
+2. **多 OCR 引擎与自定义模型切换**：新增 **Windows 原生 OCR**（超低 CPU 开销）可选引擎，并支持指定**自定义 PP-OCR ONNX 模型目录**，按游戏画风与硬件自由权衡速度与精度。
+3. **自定义实时轮询、API 冷却与并发限制**：打破原版写死的 150ms 轮询节奏，可在「高级设置 ➔ 实时翻译轮询与限流」中自定义轮询间隔（`100~5000 ms`）、API 冷却间隔（`0~10000 ms`）与最大并发数（`1~8`），兼顾响应速度与 API 限速/费用控制。
+4. **OpenAI 多段并发翻译**：在 OpenAI 相容引擎的非 Batch 模式下，多段待译文本由原本逐段 `for` 串行等待改为 `SemaphoreSlim(4)` 4 路并发请求，并按原始段落索引严格保序返回。
+5. **字幕模式专属优化（防漏句、防重复、优先抢槽）**：
+   - **优先抢槽**：引入两级优先级 OCR 门控调度，GPU 满槽时字幕区域优先获得推理槽位；
+   - **累积显示与独立延迟消失**：新字幕在旧字幕下方累积展示并独立倒计时消失（可配置停留时长与历史句数），绝不阻塞下一句翻译；
+   - **保住迟到译文与去重**：字幕累积模式下空屏清理不再丢弃仍在途的迟到译文，并结合全队列去标点/空白标准化与打字机渐进扩展去重，避免漏句或同句连屏重复。
+6. **大模型安全拒答防传染保护**：自动识别中英文常见模型安全拒答模板，拒答结果绝不写入翻译缓存与上下文历史；若请求携带了历史上下文，则自动剥离上下文单独重试，彻底杜绝单句敏感台词污染后续所有菜单与正常对话。
+
+---
+
+<div align="center">
+
   <p>
     <img src="docs/images/readme-hero.png" alt="Animated before/after comparison: the translation is overlaid right on the original text" />
     <br/>
