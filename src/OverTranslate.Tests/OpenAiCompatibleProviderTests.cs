@@ -487,7 +487,7 @@ public class OpenAiCompatibleProviderTests
         var (translated, detected) = await provider.TranslateAsync(
             blocks, "EN", "ZH-HANT", "ignored-provider-key");
 
-        Assert.Equal(["first", "second"], server.Requests.Select(sent => sent.Text));
+        Assert.Equal(["first", "second"], server.Requests.Select(sent => sent.Text).Order());
         var request = server.Requests.First();
         Assert.Equal("http://localhost:1234/v1/chat/completions", request.Url);
         Assert.Equal("Bearer secret-key", request.Authorization);

@@ -724,6 +724,90 @@
                                                         VerticalAlignment="Top"
                                                         ErrorRaised="MangaModelCard_ErrorRaised"/>
                         </Grid>
+                        <Border BorderBrush="{DynamicResource AppSubtleBorder}"
+                                BorderThickness="0,1,0,0"
+                                Padding="0,16,0,0"
+                                Margin="0,16,0,0">
+                            <StackPanel>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Border Grid.Column="0" Style="{StaticResource HotkeyRowIcon}" VerticalAlignment="Center">
+                                        <TextBlock Text="&#xE7F4;" Style="{StaticResource HotkeyRowGlyph}"/>
+                                    </Border>
+                                    <StackPanel Grid.Column="1" Margin="0,0,16,0" VerticalAlignment="Center">
+                                        <TextBlock Text="{DynamicResource S.Settings.OcrEngine}"
+                                                   Style="{StaticResource OptionTitle}"/>
+                                        <TextBlock Text="{DynamicResource S.Settings.OcrEngineHint}"
+                                                   Style="{StaticResource OptionDescription}"/>
+                                    </StackPanel>
+                                    <ComboBox x:Name="OcrEngineModeBox"
+                                              Grid.Column="2"
+                                              Width="240"
+                                              VerticalAlignment="Center"
+                                              Style="{StaticResource ModernComboBox}"
+                                              AutomationProperties.Name="{DynamicResource S.Settings.OcrEngine}"
+                                              SelectedValuePath="Tag"
+                                              SelectionChanged="OcrEngineModeBox_SelectionChanged">
+                                        <ComboBoxItem Tag="onnx" Content="{DynamicResource S.Settings.OcrEngineOnnx}"/>
+                                        <ComboBoxItem Tag="windows" Content="{DynamicResource S.Settings.OcrEngineWindows}"/>
+                                        <ComboBoxItem Tag="custom_onnx" Content="{DynamicResource S.Settings.OcrEngineCustomOnnx}"/>
+                                    </ComboBox>
+                                </Grid>
+
+                                <Grid x:Name="OcrGpuRow" Margin="0,14,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <CheckBox x:Name="OcrUseGpuCheckBox"
+                                              Grid.Column="0"
+                                              Style="{StaticResource ModernCheckBox}"
+                                              VerticalAlignment="Top"
+                                              ToolTip="{DynamicResource S.Settings.OcrUseGpu}"
+                                              Checked="OcrUseGpuCheckBox_Toggled"
+                                              Unchecked="OcrUseGpuCheckBox_Toggled"/>
+                                    <TextBlock Grid.Column="1" Text="&#xE7F8;" Style="{StaticResource OptionGlyph}"/>
+                                    <StackPanel Grid.Column="2">
+                                        <TextBlock Text="{DynamicResource S.Settings.OcrUseGpu}"
+                                                   Style="{StaticResource OptionTitle}"/>
+                                        <TextBlock Text="{DynamicResource S.Settings.OcrUseGpuHint}"
+                                                   Style="{StaticResource OptionDescription}"/>
+                                    </StackPanel>
+                                </Grid>
+
+                                <Grid x:Name="CustomOcrDirRow" Margin="0,12,0,0" Visibility="Collapsed">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                    </Grid.RowDefinitions>
+                                    <TextBlock Grid.Row="0" Grid.ColumnSpan="2"
+                                               Text="{DynamicResource S.Settings.CustomOcrModelDir}"
+                                               Style="{StaticResource FieldHint}"
+                                               Margin="0,0,0,4"/>
+                                    <TextBox x:Name="CustomOcrDirBox"
+                                             Grid.Row="1" Grid.Column="0"
+                                             Style="{StaticResource ModernTextBox}"
+                                             Margin="0,0,8,0"
+                                             PreviewKeyDown="CustomOcrDirBox_PreviewKeyDown"
+                                             LostKeyboardFocus="CustomOcrDirBox_LostKeyboardFocus"/>
+                                    <Button x:Name="BrowseCustomOcrDirBtn"
+                                            Grid.Row="1" Grid.Column="1"
+                                            Style="{StaticResource FlatButton}"
+                                            Height="34" Padding="14,0"
+                                            Content="{DynamicResource S.Settings.BrowseFolder}"
+                                            Click="BrowseCustomOcrDirBtn_Click"/>
+                                </Grid>
+                            </StackPanel>
+                        </Border>
                     </StackPanel>
                 </Border>
 
@@ -1571,6 +1655,147 @@
                                             Height="32" Padding="14,0" Margin="8,0,0,0"
                                             Content="{DynamicResource S.Assets.Change}"
                                             Click="AssetsChangeBtn_Click"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <Border BorderBrush="{DynamicResource AppSubtleBorder}"
+                                BorderThickness="0,0,0,1"
+                                Padding="0,0,0,16"
+                                Margin="0,0,0,16">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Border Grid.Column="0" Style="{StaticResource HotkeyRowIcon}" VerticalAlignment="Top">
+                                    <TextBlock Text="&#xE945;" Style="{StaticResource HotkeyRowGlyph}"/>
+                                </Border>
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock Text="{DynamicResource S.Settings.RealtimeTuning}"
+                                               Style="{StaticResource OptionTitle}"/>
+                                    <TextBlock Text="{DynamicResource S.Settings.RealtimeTuningHint}"
+                                               Style="{StaticResource OptionDescription}"
+                                               Margin="0,3,0,12"/>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                        </Grid.RowDefinitions>
+
+                                        <StackPanel Grid.Row="0" Grid.Column="0" Margin="0,0,16,10" VerticalAlignment="Center">
+                                            <TextBlock Text="{DynamicResource S.Settings.RealtimePollInterval}"
+                                                       Style="{StaticResource OptionTitle}"/>
+                                            <TextBlock Text="{DynamicResource S.Settings.RealtimePollIntervalHint}"
+                                                       Style="{StaticResource OptionDescription}"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,0,10">
+                                            <TextBox x:Name="RealtimePollIntervalBox"
+                                                     Style="{StaticResource ModernTextBox}"
+                                                     Width="88"
+                                                     MaxLength="4"
+                                                     InputMethod.IsInputMethodEnabled="False"
+                                                     PreviewTextInput="IntegerSettingBox_PreviewTextInput"
+                                                     PreviewKeyDown="IntegerSettingBox_PreviewKeyDown"
+                                                     DataObject.Pasting="IntegerSettingBox_Pasting"
+                                                     LostKeyboardFocus="RealtimeTuningBox_LostKeyboardFocus"/>
+                                            <TextBlock Text="ms"
+                                                       Width="24"
+                                                       Margin="8,0,0,0"
+                                                       VerticalAlignment="Center"
+                                                       Style="{StaticResource OptionDescription}"/>
+                                        </StackPanel>
+
+                                        <StackPanel Grid.Row="1" Grid.Column="0" Margin="0,0,16,10" VerticalAlignment="Center">
+                                            <TextBlock Text="{DynamicResource S.Settings.RealtimeTranslationCooldown}"
+                                                       Style="{StaticResource OptionTitle}"/>
+                                            <TextBlock Text="{DynamicResource S.Settings.RealtimeTranslationCooldownHint}"
+                                                       Style="{StaticResource OptionDescription}"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,0,10">
+                                            <TextBox x:Name="RealtimeCooldownBox"
+                                                     Style="{StaticResource ModernTextBox}"
+                                                     Width="88"
+                                                     MaxLength="5"
+                                                     InputMethod.IsInputMethodEnabled="False"
+                                                     PreviewTextInput="IntegerSettingBox_PreviewTextInput"
+                                                     PreviewKeyDown="IntegerSettingBox_PreviewKeyDown"
+                                                     DataObject.Pasting="IntegerSettingBox_Pasting"
+                                                     LostKeyboardFocus="RealtimeTuningBox_LostKeyboardFocus"/>
+                                            <TextBlock Text="ms"
+                                                       Width="24"
+                                                       Margin="8,0,0,0"
+                                                       VerticalAlignment="Center"
+                                                       Style="{StaticResource OptionDescription}"/>
+                                        </StackPanel>
+
+                                        <StackPanel Grid.Row="2" Grid.Column="0" Margin="0,0,16,10" VerticalAlignment="Center">
+                                            <TextBlock Text="{DynamicResource S.Settings.RealtimeMaxConcurrent}"
+                                                       Style="{StaticResource OptionTitle}"/>
+                                            <TextBlock Text="{DynamicResource S.Settings.RealtimeMaxConcurrentHint}"
+                                                       Style="{StaticResource OptionDescription}"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,32,10">
+                                            <TextBox x:Name="RealtimeMaxConcurrentBox"
+                                                     Style="{StaticResource ModernTextBox}"
+                                                     Width="88"
+                                                     MaxLength="1"
+                                                     InputMethod.IsInputMethodEnabled="False"
+                                                     PreviewTextInput="IntegerSettingBox_PreviewTextInput"
+                                                     PreviewKeyDown="IntegerSettingBox_PreviewKeyDown"
+                                                     DataObject.Pasting="IntegerSettingBox_Pasting"
+                                                     LostKeyboardFocus="RealtimeTuningBox_LostKeyboardFocus"/>
+                                        </StackPanel>
+
+                                        <StackPanel Grid.Row="3" Grid.Column="0" Margin="0,0,16,10" VerticalAlignment="Center">
+                                            <TextBlock Text="{DynamicResource S.Settings.RealtimeSubtitleHold}"
+                                                       Style="{StaticResource OptionTitle}"/>
+                                            <TextBlock Text="{DynamicResource S.Settings.RealtimeSubtitleHoldHint}"
+                                                       Style="{StaticResource OptionDescription}"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,0,10">
+                                            <TextBox x:Name="RealtimeSubtitleHoldBox"
+                                                     Style="{StaticResource ModernTextBox}"
+                                                     Width="88"
+                                                     MaxLength="5"
+                                                     InputMethod.IsInputMethodEnabled="False"
+                                                     PreviewTextInput="IntegerSettingBox_PreviewTextInput"
+                                                     PreviewKeyDown="IntegerSettingBox_PreviewKeyDown"
+                                                     DataObject.Pasting="IntegerSettingBox_Pasting"
+                                                     LostKeyboardFocus="RealtimeTuningBox_LostKeyboardFocus"/>
+                                            <TextBlock Text="ms"
+                                                       Width="24"
+                                                       Margin="8,0,0,0"
+                                                       VerticalAlignment="Center"
+                                                       Style="{StaticResource OptionDescription}"/>
+                                        </StackPanel>
+
+                                        <StackPanel Grid.Row="4" Grid.Column="0" Margin="0,0,16,0" VerticalAlignment="Center">
+                                            <TextBlock Text="{DynamicResource S.Settings.RealtimeSubtitleMaxHistory}"
+                                                       Style="{StaticResource OptionTitle}"/>
+                                            <TextBlock Text="{DynamicResource S.Settings.RealtimeSubtitleMaxHistoryHint}"
+                                                       Style="{StaticResource OptionDescription}"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Row="4" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                            <TextBox x:Name="RealtimeSubtitleMaxHistoryBox"
+                                                     Style="{StaticResource ModernTextBox}"
+                                                     Width="88"
+                                                     MaxLength="1"
+                                                     Margin="0,0,32,0"
+                                                     InputMethod.IsInputMethodEnabled="False"
+                                                     PreviewTextInput="IntegerSettingBox_PreviewTextInput"
+                                                     PreviewKeyDown="IntegerSettingBox_PreviewKeyDown"
+                                                     DataObject.Pasting="IntegerSettingBox_Pasting"
+                                                     LostKeyboardFocus="RealtimeTuningBox_LostKeyboardFocus"/>
+                                        </StackPanel>
+                                    </Grid>
                                 </StackPanel>
                             </Grid>
                         </Border>

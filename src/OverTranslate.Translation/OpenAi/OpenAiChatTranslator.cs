@@ -287,7 +287,7 @@ public sealed class OpenAiChatTranslator
         }
     }
 
-    /// <summary>Every text of the call, one after another — see <see cref="TranslateAsync"/>.</summary>
+    /// <summary>Every text of the call, up to four at a time — see <see cref="TranslateAsync"/>.</summary>
     private async Task SegmentsAsync(Job job)
     {
         var watch = Stopwatch.StartNew();
@@ -299,39 +299,57 @@ public sealed class OpenAiChatTranslator
         }
 
         var soFar = new List<OpenAiTranslationPair>();
-        var unreachable = false;
+        var unreachable = 0;
+        using var semaphore = new SemaphoreSlim(4, 4);
+        var tasks = new Task[sent.Count];
+
         for (var k = 0; k < sent.Count; k++)
-        {
-            var index = sent[k];
-            if (unreachable || job.Stopped)
-            {
-                job.Outcomes[index] = OpenAiChatOutcome.NotSent;
-                continue;
-            }
+            tasks[k] = RunSegmentAsync(k, sent[k]);
 
-            var text = job.Texts[index];
-            try
-            {
-                var earlier = Earlier(job.Context.History, job.Context.Screen, soFar);
-                var translation = await OnceMoreAsync(job, Message(job.Request, text, earlier), text, job.Token);
-                job.Succeed(index, translation);
-                soFar.Add(new OpenAiTranslationPair(text, translation));
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException || !job.Token.IsCancellationRequested)
-            {
-                job.Fail(index, ex);
-                if (MightBeTheTexts(ex)) continue;
-
-                unreachable = true;
-                Log.Info("OpenAI 相容翻譯：第 {Index} 段失敗（{Reason}），不再送其餘 {Rest} 段",
-                    k + 1, Reason(ex), sent.Count - k - 1);
-            }
-        }
+        await Task.WhenAll(tasks);
 
         // Counts only, never the text, so this stays in the shipped log: it is what explains a screen
         // that took far longer than usual.
         Log.Info("OpenAI 相容翻譯：{Count} 段逐段完成（{Skipped} 段沒有文字不送），{Elapsed} ms，重送 {Again} 段",
             sent.Count, job.Texts.Count - sent.Count, watch.ElapsedMilliseconds, job.Again);
+
+        async Task RunSegmentAsync(int slot, int index)
+        {
+            await semaphore.WaitAsync(job.Token);
+            try
+            {
+                if (Volatile.Read(ref unreachable) != 0 || job.Stopped)
+                {
+                    job.Outcomes[index] = OpenAiChatOutcome.NotSent;
+                    return;
+                }
+
+                var text = job.Texts[index];
+                try
+                {
+                    List<OpenAiTranslationPair> earlier;
+                    lock (soFar)
+                        earlier = Earlier(job.Context.History, job.Context.Screen, soFar);
+                    var translation = await OnceMoreAsync(job, Message(job.Request, text, earlier), text, job.Token);
+                    job.Succeed(index, translation);
+                    lock (soFar)
+                        soFar.Add(new OpenAiTranslationPair(text, translation));
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException || !job.Token.IsCancellationRequested)
+                {
+                    job.Fail(index, ex);
+                    if (MightBeTheTexts(ex)) return;
+
+                    if (Interlocked.Exchange(ref unreachable, 1) == 0)
+                        Log.Info("OpenAI 相容翻譯：第 {Index} 段失敗（{Reason}），不再送其餘 {Rest} 段",
+                            slot + 1, Reason(ex), sent.Count - slot - 1);
+                }
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }
     }
 
     /// <summary>

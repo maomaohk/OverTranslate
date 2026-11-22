@@ -262,6 +262,18 @@ public partial class SettingsPage : UserControl
 
             VerboseLoggingSwitch.IsSecondSelected = s.VerboseLogging;
 
+            OcrEngineModeBox.SelectedValue = s.OcrEngineMode;
+            if (OcrEngineModeBox.SelectedValue is null) OcrEngineModeBox.SelectedIndex = 0;
+            OcrUseGpuCheckBox.IsChecked = s.OcrUseGpu;
+            CustomOcrDirBox.Text = s.CustomOcrModelDir;
+            UpdateOcrEngineRows(s.OcrEngineMode);
+
+            RealtimePollIntervalBox.Text = s.Realtime.PollIntervalMs.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            RealtimeCooldownBox.Text = s.Realtime.MinTranslationIntervalMs.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            RealtimeMaxConcurrentBox.Text = s.Realtime.MaxConcurrentTranslations.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            RealtimeSubtitleHoldBox.Text = s.Realtime.SubtitleHoldMs.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            RealtimeSubtitleMaxHistoryBox.Text = s.Realtime.SubtitleMaxHistory.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
             OcrLineBoxesCheckBox.IsChecked = s.OcrDebug.ShowLineBoxes;
             TextGroupBoxesCheckBox.IsChecked = s.OcrDebug.ShowGroupBoxes;
             DebugSourceOnlyRadio.IsChecked = !s.OcrDebug.ShowOnTranslation;
@@ -606,6 +618,144 @@ public partial class SettingsPage : UserControl
 
         LogLevelService.Apply(verbose);
         Persist(s => s.VerboseLogging = verbose);
+    }
+
+    private static bool IsDigits(string text) => text.Length > 0 && text.All(c => c is >= '0' and <= '9');
+
+    private void IntegerSettingBox_PreviewTextInput(object sender, TextCompositionEventArgs e) =>
+        e.Handled = !IsDigits(e.Text);
+
+    private void IntegerSettingBox_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Space)
+        {
+            e.Handled = true;
+            return;
+        }
+
+        if (e.Key == Key.Enter)
+        {
+            CommitRealtimeTuning();
+            Keyboard.ClearFocus();
+            e.Handled = true;
+        }
+    }
+
+    private void IntegerSettingBox_Pasting(object sender, DataObjectPastingEventArgs e)
+    {
+        if (e.DataObject.GetData(System.Windows.DataFormats.UnicodeText) is not string pasted || !IsDigits(pasted))
+            e.CancelCommand();
+    }
+
+    private void RealtimeTuningBox_LostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e) =>
+        CommitRealtimeTuning();
+
+    private void CommitRealtimeTuning()
+    {
+        if (_loading) return;
+
+        var current = SettingsService.Instance.Current.Realtime;
+        var poll = ParseClampedInt(RealtimePollIntervalBox, current.PollIntervalMs,
+            RealtimeSettings.MinPollIntervalMs, RealtimeSettings.MaxPollIntervalMs);
+        var cooldown = ParseClampedInt(RealtimeCooldownBox, current.MinTranslationIntervalMs,
+            RealtimeSettings.MinTranslationIntervalMsLimit, RealtimeSettings.MaxTranslationIntervalMsLimit);
+        var concurrent = ParseClampedInt(RealtimeMaxConcurrentBox, current.MaxConcurrentTranslations,
+            RealtimeSettings.MinConcurrentTranslationsLimit, RealtimeSettings.MaxConcurrentTranslationsLimit);
+        var subtitleHold = ParseClampedInt(RealtimeSubtitleHoldBox, current.SubtitleHoldMs,
+            RealtimeSettings.MinSubtitleHoldMs, RealtimeSettings.MaxSubtitleHoldMs);
+        var subtitleMaxHistory = ParseClampedInt(RealtimeSubtitleMaxHistoryBox, current.SubtitleMaxHistory,
+            RealtimeSettings.MinSubtitleMaxHistory, RealtimeSettings.MaxSubtitleMaxHistory);
+
+        if (poll == current.PollIntervalMs
+            && cooldown == current.MinTranslationIntervalMs
+            && concurrent == current.MaxConcurrentTranslations
+            && subtitleHold == current.SubtitleHoldMs
+            && subtitleMaxHistory == current.SubtitleMaxHistory)
+            return;
+
+        Persist(s =>
+        {
+            s.Realtime.PollIntervalMs = poll;
+            s.Realtime.MinTranslationIntervalMs = cooldown;
+            s.Realtime.MaxConcurrentTranslations = concurrent;
+            s.Realtime.SubtitleHoldMs = subtitleHold;
+            s.Realtime.SubtitleMaxHistory = subtitleMaxHistory;
+        });
+    }
+
+    private static int ParseClampedInt(TextBox box, int fallback, int min, int max)
+    {
+        var value = int.TryParse(
+            box.Text, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var parsed)
+            ? Math.Clamp(parsed, min, max)
+            : fallback;
+        box.Text = value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return value;
+    }
+
+    private void UpdateOcrEngineRows(string mode)
+    {
+        var isOnnx = mode != AppSettings.OcrEngineWindows;
+        OcrUseGpuCheckBox.IsEnabled = isOnnx;
+        OcrGpuRow.Opacity = isOnnx ? 1.0 : 0.55;
+        CustomOcrDirRow.Visibility = mode == AppSettings.OcrEngineCustomOnnx
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+    }
+
+    private void OcrEngineModeBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_loading || OcrEngineModeBox.SelectedValue is not string mode) return;
+
+        UpdateOcrEngineRows(mode);
+        Persist(s => s.OcrEngineMode = mode);
+        AppServices.Ocr.ApplySettings(SettingsService.Instance.Current);
+    }
+
+    private void OcrUseGpuCheckBox_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_loading) return;
+
+        var useGpu = OcrUseGpuCheckBox.IsChecked == true;
+        Persist(s => s.OcrUseGpu = useGpu);
+        AppServices.Ocr.ApplySettings(SettingsService.Instance.Current);
+    }
+
+    private void CustomOcrDirBox_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Enter) return;
+        CommitCustomOcrDir();
+        Keyboard.ClearFocus();
+        e.Handled = true;
+    }
+
+    private void CustomOcrDirBox_LostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e) =>
+        CommitCustomOcrDir();
+
+    private void CommitCustomOcrDir()
+    {
+        if (_loading) return;
+
+        var dir = CustomOcrDirBox.Text.Trim();
+        CustomOcrDirBox.Text = dir;
+        if (string.Equals(dir, SettingsService.Instance.Current.CustomOcrModelDir, StringComparison.Ordinal))
+            return;
+
+        Persist(s => s.CustomOcrModelDir = dir);
+        AppServices.Ocr.ApplySettings(SettingsService.Instance.Current);
+    }
+
+    private void BrowseCustomOcrDirBtn_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFolderDialog
+        {
+            Title = LocalizationService.Get("S.Settings.CustomOcrModelDir"),
+            InitialDirectory = System.IO.Directory.Exists(CustomOcrDirBox.Text) ? CustomOcrDirBox.Text : ""
+        };
+        if (dialog.ShowDialog(Window.GetWindow(this)) != true) return;
+
+        CustomOcrDirBox.Text = dialog.FolderName;
+        CommitCustomOcrDir();
     }
 
     /// <summary>How long the 偵錯工具 fold takes, and the shape of it.</summary>

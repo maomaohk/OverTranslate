@@ -109,8 +109,33 @@ public class OcrService : IDisposable
 {
     private static readonly NLog.Logger Log = NLog.LogManager.GetCurrentClassLogger();
 
-    private readonly OnnxOcrEngine _engine = new();
+    private readonly OnnxOcrEngine _onnxEngine = new();
+    private readonly WindowsOcrEngine _windowsEngine = new();
     private readonly MangaOcrEngine? _manga;
+    private volatile string _engineMode = Models.AppSettings.OcrEngineOnnx;
+
+    private IOcrEngine ActiveEngine =>
+        _engineMode == Models.AppSettings.OcrEngineWindows ? _windowsEngine : _onnxEngine;
+
+    internal bool SupportsDetectionGate => _engineMode != Models.AppSettings.OcrEngineWindows;
+
+    public void ApplySettings(Models.AppSettings settings) =>
+        Configure(settings.OcrEngineMode, settings.OcrUseGpu, settings.CustomOcrModelDir);
+
+    public void Configure(string engineMode, bool useGpu, string? customModelDir)
+    {
+        var normalizedMode = engineMode is Models.AppSettings.OcrEngineWindows or Models.AppSettings.OcrEngineCustomOnnx
+            ? engineMode
+            : Models.AppSettings.OcrEngineOnnx;
+
+        _engineMode = normalizedMode;
+        _onnxEngine.Configure(
+            useGpu,
+            normalizedMode == Models.AppSettings.OcrEngineCustomOnnx ? customModelDir : "");
+
+        if (normalizedMode == Models.AppSettings.OcrEngineWindows)
+            _onnxEngine.ReleaseNow();
+    }
 
     public OcrService()
     {
@@ -147,9 +172,10 @@ public class OcrService : IDisposable
 
         // The mode picks the thresholds for horizontal text only. Vertical has its own profile and
         // does not take a parameter for one — see RecognizeVerticalAsync.
+        var engine = ActiveEngine;
         return LevelCrowdedTilts(verticalText
-            ? RecognizeVerticalAsync(_engine, bitmap, language, cancellationToken, _manga)
-            : RecognizeAndGroupAsync(_engine, bitmap, language, GroupingProfile.For(layoutMode), cancellationToken));
+            ? RecognizeVerticalAsync(engine, bitmap, language, cancellationToken, _manga)
+            : RecognizeAndGroupAsync(engine, bitmap, language, GroupingProfile.For(layoutMode), cancellationToken));
     }
 
     // Here, where every path's groups are final — columns and the lines across a vertical page
@@ -197,15 +223,16 @@ public class OcrService : IDisposable
         if (!OcrLanguageRouter.IsSupported(sourceLanguage))
             throw new NotSupportedException(OcrLanguageRouter.GetUnsupportedLanguageMessage(sourceLanguage));
 
+        var engine = ActiveEngine;
         if (orientation == Realtime.RealtimeTextOrientation.Vertical)
         {
             var columns = await TryRecognizeVerticalAsync(
-                _engine, bitmap, OcrLanguageRouter.Normalize(sourceLanguage), maxDetectSize, cancellationToken,
+                engine, bitmap, OcrLanguageRouter.Normalize(sourceLanguage), maxDetectSize, cancellationToken,
                 _manga);
             return columns is null ? null : TiltedOverlap.Level(columns);
         }
 
-        var blocks = await _engine.TryRecognizeAsync(
+        var blocks = await engine.TryRecognizeAsync(
             bitmap, OcrLanguageRouter.Normalize(sourceLanguage), maxDetectSize, cancellationToken);
 
         if (blocks is null)
@@ -285,10 +312,19 @@ public class OcrService : IDisposable
         string sourceLanguage,
         int maxDetectSize,
         float minimumScore,
-        CancellationToken cancellationToken = default) =>
-        _engine.TryDetectTextAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (_engineMode == Models.AppSettings.OcrEngineWindows)
+        {
+            IReadOnlyList<System.Windows.Rect> bypass =
+                [new System.Windows.Rect(0, 0, Math.Max(1, bitmap.Width), Math.Max(1, bitmap.Height))];
+            return Task.FromResult<IReadOnlyList<System.Windows.Rect>?>(bypass);
+        }
+
+        return _onnxEngine.TryDetectTextAsync(
             bitmap, OcrLanguageRouter.Normalize(sourceLanguage), maxDetectSize, minimumScore,
             cancellationToken);
+    }
 
     /// <param name="decisions">
     /// Diagnostic only, and null everywhere but OcrHarness. Passed to whichever grouper this mode
@@ -529,7 +565,8 @@ public class OcrService : IDisposable
     /// </summary>
     public void SetKeepWarm(bool keepWarm)
     {
-        _engine.SetKeepWarm(keepWarm);
+        if (_engineMode != Models.AppSettings.OcrEngineWindows)
+            _onnxEngine.SetKeepWarm(keepWarm);
         _manga?.SetKeepWarm(keepWarm);
     }
 
@@ -552,11 +589,14 @@ public class OcrService : IDisposable
     {
         var loads = new List<Task>(2);
 
-        _engine.SetKeepWarm(true);
-        if (!_engine.IsLoaded(sourceLanguage))
+        if (_engineMode != Models.AppSettings.OcrEngineWindows)
         {
-            Log.Info("Loading the OCR model ahead of a realtime session");
-            loads.Add(_engine.PreloadAsync(sourceLanguage));
+            _onnxEngine.SetKeepWarm(true);
+            if (!_onnxEngine.IsLoaded(sourceLanguage))
+            {
+                Log.Info("Loading the OCR model ahead of a realtime session");
+                loads.Add(_onnxEngine.PreloadAsync(sourceLanguage));
+            }
         }
 
         if (_manga is not null && vertical && ReadsVerticalWithMangaModels(sourceLanguage))
@@ -578,7 +618,9 @@ public class OcrService : IDisposable
     }
 
     /// <summary>Whether either engine is loading its models right now; never waits for them.</summary>
-    internal bool IsLoadingModels => _engine.IsLoading || _manga?.IsLoading == true;
+    internal bool IsLoadingModels =>
+        (_engineMode != Models.AppSettings.OcrEngineWindows && _onnxEngine.IsLoading)
+        || _manga?.IsLoading == true;
 
     /// <summary>
     /// Releases the loaded model immediately rather than after the inactivity delay — see
@@ -586,7 +628,7 @@ public class OcrService : IDisposable
     /// </summary>
     public void ReleaseModel()
     {
-        _engine.ReleaseNow();
+        _onnxEngine.ReleaseNow();
         _manga?.ReleaseNow();
     }
 
@@ -611,7 +653,8 @@ public class OcrService : IDisposable
     public void Dispose()
     {
         _manga?.Dispose();
-        _engine.Dispose();
+        _onnxEngine.Dispose();
+        _windowsEngine.Dispose();
     }
 
     private static async Task<List<OcrTextBlock>> RecognizeAndGroupAsync(

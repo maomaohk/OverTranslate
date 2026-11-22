@@ -371,6 +371,61 @@ public class RealtimeSettings
     /// </remarks>
     public bool SampleSourceTextColor { get; set; } = false;
 
+    public const int MinPollIntervalMs = 100;
+    public const int MaxPollIntervalMs = 5000;
+    public const int DefaultPollIntervalMs = 150;
+
+    public const int MinTranslationIntervalMsLimit = 0;
+    public const int MaxTranslationIntervalMsLimit = 10000;
+
+    public const int MinConcurrentTranslationsLimit = 1;
+    public const int MaxConcurrentTranslationsLimit = 8;
+    public const int DefaultConcurrentTranslations = 4;
+
+    public const int MinSubtitleHoldMs = 0;
+    public const int MaxSubtitleHoldMs = 15000;
+    public const int DefaultSubtitleHoldMs = 3000;
+
+    public const int MinSubtitleMaxHistory = 1;
+    public const int MaxSubtitleMaxHistory = 6;
+    public const int DefaultSubtitleMaxHistory = 3;
+
+    private int _pollIntervalMs = DefaultPollIntervalMs;
+    private int _minTranslationIntervalMs = 0;
+    private int _maxConcurrentTranslations = DefaultConcurrentTranslations;
+    private int _subtitleHoldMs = DefaultSubtitleHoldMs;
+    private int _subtitleMaxHistory = DefaultSubtitleMaxHistory;
+
+    public int PollIntervalMs
+    {
+        get => _pollIntervalMs;
+        set => _pollIntervalMs = Math.Clamp(value, MinPollIntervalMs, MaxPollIntervalMs);
+    }
+
+    public int MinTranslationIntervalMs
+    {
+        get => _minTranslationIntervalMs;
+        set => _minTranslationIntervalMs = Math.Clamp(value, MinTranslationIntervalMsLimit, MaxTranslationIntervalMsLimit);
+    }
+
+    public int MaxConcurrentTranslations
+    {
+        get => _maxConcurrentTranslations;
+        set => _maxConcurrentTranslations = Math.Clamp(value, MinConcurrentTranslationsLimit, MaxConcurrentTranslationsLimit);
+    }
+
+    public int SubtitleHoldMs
+    {
+        get => _subtitleHoldMs;
+        set => _subtitleHoldMs = Math.Clamp(value, MinSubtitleHoldMs, MaxSubtitleHoldMs);
+    }
+
+    public int SubtitleMaxHistory
+    {
+        get => _subtitleMaxHistory;
+        set => _subtitleMaxHistory = Math.Clamp(value, MinSubtitleMaxHistory, MaxSubtitleMaxHistory);
+    }
+
     /// <summary>
     /// Puts every 顯示外觀 value back to what it ships as: both colours and the mode each is in, the
     /// weight of the band, the border with its own two values, and the text size with its own.

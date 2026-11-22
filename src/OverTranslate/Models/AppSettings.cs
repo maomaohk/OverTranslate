@@ -288,6 +288,22 @@ public class AppSettings
     /// </remarks>
     public bool UseMangaModels { get; set; } = true;
 
+    public const string OcrEngineOnnx = "onnx";
+    public const string OcrEngineWindows = "windows";
+    public const string OcrEngineCustomOnnx = "custom_onnx";
+
+    private string _ocrEngineMode = OcrEngineOnnx;
+
+    public string OcrEngineMode
+    {
+        get => _ocrEngineMode;
+        set => _ocrEngineMode = value is OcrEngineWindows or OcrEngineCustomOnnx ? value : OcrEngineOnnx;
+    }
+
+    public bool OcrUseGpu { get; set; } = false;
+
+    public string CustomOcrModelDir { get; set; } = "";
+
     /// <summary>Empty means "use ScreenshotSaveService.DefaultDirectory" (圖片\OverTranslate).</summary>
     public string ScreenshotSavePath { get; set; } = "";
     /// <summary>Off by default: Debug records the recognised text, i.e. the user's screen contents.</summary>

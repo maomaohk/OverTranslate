@@ -616,7 +616,7 @@ internal sealed class RealtimeSessionController
         // on is worse than none. Updates queued before this carry an older generation and
         // OnRegionUpdated refuses to put them back.
         foreach (var window in _blockWindows.Values)
-            window.SetLines([]);
+            window.Clear();
         _shownLines.Clear();
 
         control.SetPaused(true);
@@ -978,7 +978,16 @@ internal sealed class RealtimeSessionController
         control.BringToFront();
         _stayOnTop.Start();
 
-        _session.Start(regions, request.SourceLanguage, request.TargetLanguage, request.Provider, capture);
+        var realtimeSettings = SettingsService.Instance.Current.Realtime;
+        _session.Start(
+            regions,
+            request.SourceLanguage,
+            request.TargetLanguage,
+            request.Provider,
+            capture,
+            pollIntervalMs: realtimeSettings.PollIntervalMs,
+            minTranslationIntervalMs: realtimeSettings.MinTranslationIntervalMs,
+            maxConcurrentTranslations: realtimeSettings.MaxConcurrentTranslations);
         _loadingHint?.Wait(_session.ModelsLoading);
     }
 
@@ -1006,6 +1015,7 @@ internal sealed class RealtimeSessionController
     private void ShowBlockWindows(RealtimeStartRequest request, IReadOnlyList<RealtimeRegion> regions)
     {
         var copies = _compareDisplay ? CompareLocations(request) : null;
+        var realtimeSettings = SettingsService.Instance.Current.Realtime;
 
         // Resolved before the overlays are shown. They are click-through and belong to this process,
         foreach (var region in regions)
@@ -1020,7 +1030,8 @@ internal sealed class RealtimeSessionController
                 look.SampleTextColor,
                 region.Profile.Layout, look.Border, look.BorderColor, region.Orientation,
                 compared ? copies![region.Id] : null, compared ? block.CompareScale : 1.0,
-                look.FixedFontSize, region.Profile.Align);
+                look.FixedFontSize, region.Profile.Align,
+                realtimeSettings.SubtitleHoldMs, realtimeSettings.SubtitleMaxHistory);
             _blockWindows[region.Id] = window;
             window.Show();
         }
@@ -1115,6 +1126,9 @@ internal sealed class RealtimeSessionController
         if (!IsTranslating || _blockWindows.Count == 0) return;
 
         var shown = new Dictionary<int, IReadOnlyList<TranslatedBlock>>(_shownLines);
+        var histories = _blockWindows.ToDictionary(
+            pair => pair.Key,
+            pair => (History: pair.Value.SnapshotSubtitleHistory(), SourceActive: pair.Value.IsSourceActive));
 
         CloseBlockWindows();
         ShowBlockWindows(request, Regions());
@@ -1123,7 +1137,10 @@ internal sealed class RealtimeSessionController
         foreach (var (id, lines) in shown)
         {
             if (!_blockWindows.TryGetValue(id, out var window)) continue;
-            window.SetLines(lines);
+            if (histories.TryGetValue(id, out var saved) && saved.History.Count > 0)
+                window.RestoreSubtitleHistory(saved.History, saved.SourceActive);
+            else
+                window.SetLines(lines);
             _shownLines[id] = lines;
         }
 
@@ -1747,7 +1764,10 @@ internal sealed class RealtimeSessionController
     private void CloseBlockWindows()
     {
         foreach (var window in _blockWindows.Values)
+        {
+            window.Clear();
             CloseWindow(window, nameof(RealtimeBlockWindow));
+        }
         _blockWindows.Clear();
         _shownLines.Clear();
         RefreshOverlayHandles();

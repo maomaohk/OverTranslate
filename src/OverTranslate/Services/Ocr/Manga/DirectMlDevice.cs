@@ -93,9 +93,13 @@ internal static class DirectMlDevice
         lock (LoadSync)
         {
             if (_loaded is not null)
-                return string.Equals(_loaded, path, StringComparison.OrdinalIgnoreCase)
-                    ? null
-                    : $"another DirectML.dll was loaded already ({_loaded})";
+            {
+                if (string.Equals(_loaded, path, StringComparison.OrdinalIgnoreCase))
+                    return null;
+                if (string.Equals(_loaded, BundledLibraryPath, StringComparison.OrdinalIgnoreCase))
+                    return Problem(path, file);
+                return $"another DirectML.dll was loaded already ({_loaded})";
+            }
 
             if (Problem(path, file) is { } problem)
                 return problem;
@@ -111,6 +115,38 @@ internal static class DirectMlDevice
             _loaded = path;
             return null;
         }
+    }
+
+    private static string BundledLibraryPath => Path.Combine(AppContext.BaseDirectory, LibraryName);
+
+    internal static string? LoadBundledOrFallback(string? fallbackPath = null, MangaModelFile? fallbackFile = null)
+    {
+        var bundled = BundledLibraryPath;
+        if (File.Exists(bundled))
+        {
+            lock (LoadSync)
+            {
+                if (_loaded is not null)
+                    return null;
+
+                if (GetModuleHandleW(LibraryName) is var existing && existing != IntPtr.Zero)
+                {
+                    _loaded = ModulePath(existing);
+                    return null;
+                }
+
+                if (NativeLibrary.TryLoad(bundled, out var handle))
+                {
+                    if (GetModuleHandleW(LibraryName) == handle)
+                    {
+                        _loaded = bundled;
+                        return null;
+                    }
+                }
+            }
+        }
+
+        return Load(fallbackPath, fallbackFile);
     }
 
     /// <summary>Why the file at <paramref name="path"/> is not the runtime the manifest names, or null.</summary>

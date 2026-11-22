@@ -81,8 +81,13 @@ public sealed class RealtimeTranslationSession
     private readonly RealtimeInFlightTranslations _inFlight = new();
 
     // Shared by every region's pump, for the reasons on MaxConcurrentTranslations.
-    private readonly SemaphoreSlim _translationSlots =
+    private SemaphoreSlim _translationSlots =
         new(MaxConcurrentTranslations, MaxConcurrentTranslations);
+    private readonly SemaphoreSlim _translationPaceLock = new(1, 1);
+    private TimeSpan _pollInterval = PollInterval;
+    private TimeSpan _minTranslationInterval = TimeSpan.Zero;
+    private int _maxConcurrentTranslations = MaxConcurrentTranslations;
+    private long _lastTranslationRequestAt;
 
     // A session-wide failure — a missing API key, a provider that is down — reaches every region at
     // once. Held here rather than per region so three regions report it once between them, and so
@@ -198,13 +203,35 @@ public sealed class RealtimeTranslationSession
         Models.TranslationProvider provider,
         IRealtimeCaptureBackend capture,
         bool readAtOnce = false,
-        bool warmUp = true)
+        bool warmUp = true,
+        int? pollIntervalMs = null,
+        int? minTranslationIntervalMs = null,
+        int? maxConcurrentTranslations = null)
     {
         // Not the public Stop: this one is the tail of the previous run only when there was one,
         // and 繼續 comes through here with the same backend it is about to keep using. Reporting on
         // it now would put a partial total in the log every time the user unpauses, and the line is
         // supposed to be the closing summary of one run of translating.
         Stop(releaseRecogniser: false, reportCapture: false);
+
+        if (pollIntervalMs is { } pollMs)
+            _pollInterval = TimeSpan.FromMilliseconds(Math.Clamp(
+                pollMs,
+                (int)RealtimeRegionState.MinPollInterval.TotalMilliseconds,
+                Models.RealtimeSettings.MaxPollIntervalMs));
+        if (minTranslationIntervalMs is { } minIntervalMs)
+            _minTranslationInterval = TimeSpan.FromMilliseconds(Math.Clamp(
+                minIntervalMs,
+                Models.RealtimeSettings.MinTranslationIntervalMsLimit,
+                Models.RealtimeSettings.MaxTranslationIntervalMsLimit));
+        if (maxConcurrentTranslations is { } maxConcurrent)
+            _maxConcurrentTranslations = Math.Clamp(
+                maxConcurrent,
+                Models.RealtimeSettings.MinConcurrentTranslationsLimit,
+                Models.RealtimeSettings.MaxConcurrentTranslationsLimit);
+
+        _translationSlots = new SemaphoreSlim(_maxConcurrentTranslations, _maxConcurrentTranslations);
+        Volatile.Write(ref _lastTranslationRequestAt, 0);
 
         _provider = provider;
         _regions = regions;
@@ -610,15 +637,18 @@ public sealed class RealtimeTranslationSession
         StepMarker step,
         CancellationToken token)
     {
-        var state = new RealtimeRegionState(region.Orientation, region.Profile.ClearAfterEmptyReads);
+        var pollInterval = _pollInterval;
+        var maxPollsScrolledPast = Math.Max(1, (int)Math.Round(TimeSpan.FromMilliseconds(1800) / pollInterval));
+        var state = new RealtimeRegionState(region.Orientation, region.Profile.ClearAfterEmptyReads, pollInterval);
         // Everything this region draws goes to the screen through here — see RealtimeScrollFollow.
         var follow = new RealtimeScrollFollow(
             region.Id, (lines, generation) => RaiseRegionUpdated(new RealtimeRegionUpdate(region.Id, lines, generation) { Loop = token }));
-        var pump = new RegionTranslationPump(this, region, follow, sourceLanguage, targetLanguage, token);
+        var pump = new RegionTranslationPump(
+            this, region, follow, sourceLanguage, targetLanguage, _translationSlots, _maxConcurrentTranslations, token);
 
         try
         {
-            using var timer = new PeriodicTimer(PollInterval);
+            using var timer = new PeriodicTimer(pollInterval);
             var lastScan = Stopwatch.GetTimestamp();
             var skippedPolls = 0;
             var asked = readAtOnce;
@@ -724,7 +754,7 @@ public sealed class RealtimeTranslationSession
                 // never stops is still read, a little less often, as it always was.
                 step.Set("follow");
                 var pace = follow.Observe(frame, Stopwatch.GetTimestamp());
-                if (pace == ScrollPace.Scrolling && !demanded && scrolledPast < MaxPollsScrolledPast)
+                if (pace == ScrollPace.Scrolling && !demanded && scrolledPast < maxPollsScrolledPast)
                 {
                     scrolledPast++;
                     skippedPolls++;
@@ -781,6 +811,7 @@ public sealed class RealtimeTranslationSession
                 // quarters of the empty frames for a fifth of what the pass behind it costs, and is
                 // what lets those timers run several times as often as they used to.
                 if (reason != RealtimeReadReason.TextChanged
+                    && _ocr.SupportsDetectionGate
                     && RealtimeGate.WorthGating(frame.Width, frame.Height))
                 {
                     var gateSize = RealtimeGate.SizeFor(frame.Width, frame.Height, gateAlternate);
@@ -1526,6 +1557,8 @@ public sealed class RealtimeTranslationSession
                 context = new TranslationContext(history.Count > 0 ? history : null, screen);
             }
 
+            await WaitTranslationCooldownAsync(token).ConfigureAwait(false);
+
             var (results, _) = await _translation.TranslateAsync(
                 missing, sourceLanguage, targetLanguage, apiKey, cancellationToken: token, engine: _provider,
                 context: context);
@@ -1620,12 +1653,37 @@ public sealed class RealtimeTranslationSession
     /// and they may finish out of order — hence the pass number every result carries, and the rule
     /// that a result is dropped once a later pass has reached the screen.
     /// </remarks>
+    private async Task WaitTranslationCooldownAsync(CancellationToken token)
+    {
+        var interval = _minTranslationInterval;
+        if (interval <= TimeSpan.Zero) return;
+
+        await _translationPaceLock.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            var last = Volatile.Read(ref _lastTranslationRequestAt);
+            if (last != 0)
+            {
+                var remaining = interval - Stopwatch.GetElapsedTime(last);
+                if (remaining > TimeSpan.Zero)
+                    await Task.Delay(remaining, token).ConfigureAwait(false);
+            }
+            Volatile.Write(ref _lastTranslationRequestAt, Stopwatch.GetTimestamp());
+        }
+        finally
+        {
+            _translationPaceLock.Release();
+        }
+    }
+
     private sealed class RegionTranslationPump(
         RealtimeTranslationSession session,
         RealtimeRegion region,
         RealtimeScrollFollow follow,
         string sourceLanguage,
         string targetLanguage,
+        SemaphoreSlim translationSlots,
+        int maxConcurrentTranslations,
         CancellationToken token)
     {
         private readonly RealtimePublishOrder _order = new();
@@ -1640,7 +1698,7 @@ public sealed class RealtimeTranslationSession
         public void Post(
             long pass, List<OcrTextBlock> blocks, int ocrMs, Bitmap frame, RealtimeScrollFollow.ReadStart readFrom)
         {
-            if (!session._translationSlots.Wait(0))
+            if (!translationSlots.Wait(0))
             {
                 // Every slot is held by a translation that has not answered, so the provider is
                 // stalled rather than merely slow. Nothing in flight can be recalled to make room,
@@ -1653,11 +1711,11 @@ public sealed class RealtimeTranslationSession
                     Log.Warn(
                         "Realtime region {Region} dropped a read: {InFlight} translations already in " +
                         "flight; further drops logged at Debug",
-                        region.Id, MaxConcurrentTranslations);
+                        region.Id, maxConcurrentTranslations);
                 else
                     Log.Debug(
                         "Realtime region {Region} dropped a read: {InFlight} translations already in flight",
-                        region.Id, MaxConcurrentTranslations);
+                        region.Id, maxConcurrentTranslations);
                 RequestRetry();
                 return;
             }
@@ -1737,7 +1795,7 @@ public sealed class RealtimeTranslationSession
                 finally
                 {
                     session.SetBusy(false);
-                    session._translationSlots.Release();
+                    translationSlots.Release();
                 }
             });
         }

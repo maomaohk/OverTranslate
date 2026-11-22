@@ -28,7 +28,14 @@ internal static class AppServices
     public static Services.Ocr.Manga.MangaModelStore MangaModels { get; } = Services.Ocr.Manga.MangaModelStore.CreateDefault();
 
     /// <summary>Recognition. Construction is cheap — the model itself is loaded on first use.</summary>
-    public static OcrService Ocr { get; } = new(MangaModels);
+    public static OcrService Ocr { get; } = CreateOcrService();
+
+    private static OcrService CreateOcrService()
+    {
+        var service = new OcrService(MangaModels);
+        service.ApplySettings(SettingsService.Instance.Current);
+        return service;
+    }
 
     /// <summary>本機 AI 翻譯: its models, and the server that runs them. Nothing starts until it is used.</summary>
     public static LocalAi.LocalAiService LocalAi { get; } = new(Services.LocalAi.LocalAiModelStore.CreateDefault());

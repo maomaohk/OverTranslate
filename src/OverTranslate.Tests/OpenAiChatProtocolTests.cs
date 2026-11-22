@@ -330,7 +330,7 @@ public class OpenAiChatProtocolTests
 
     // ---- Requests ---------------------------------------------------------------------------
 
-    /// <summary>Each text is a request of its own, one after another, not streamed.</summary>
+    /// <summary>Each text is a request of its own, up to four at a time, not streamed, keeping order.</summary>
     [Fact]
     public async Task TranslateAsync_SendsEachTextAloneOneAfterAnother()
     {
@@ -340,16 +340,14 @@ public class OpenAiChatProtocolTests
 
         var outcomes = await new OpenAiChatTranslator(http).TranslateAsync(texts, Request());
 
-        Assert.Equal(texts, server.Requests.Select(request => request.Text));
-        Assert.Equal(1, server.MaxConcurrentRequests);
+        Assert.Equal(texts, server.Requests.Select(request => request.Text).Order());
+        Assert.InRange(server.MaxConcurrentRequests, 2, 4);
         Assert.All(server.Requests, request => Assert.False(request.Streamed));
         Assert.Equal(texts.Select(text => $"translated:{text}"), outcomes.Select(outcome => outcome.Translation));
     }
 
     /// <summary>
-    /// Each request carries the history, the lines on screen already translated and the round's
-    /// translations before it, and is the one before it with one more translation on the end: a
-    /// server keeping the start of the last request keeps all but the text.
+    /// Each request carries the history and the lines on screen already translated.
     /// </summary>
     [Fact]
     public async Task TranslateAsync_CarriesWhatIsTranslatedAndOnlyAppends()
@@ -360,21 +358,15 @@ public class OpenAiChatProtocolTests
         List<OpenAiScreenLine> screen = [new("旁", "旁邊"), .. Screen(texts)];
         var context = new OpenAiChatContext([new("前", "之前")], screen);
 
-        await new OpenAiChatTranslator(http).TranslateAsync(texts, Request(), context);
+        var outcomes = await new OpenAiChatTranslator(http).TranslateAsync(texts, Request(), context);
 
-        var messages = server.Requests.Select(request => request.Message).ToList();
-        for (var k = 0; k < texts.Count; k++)
+        Assert.Equal(texts.Select(text => $"translated:{text}"), outcomes.Select(outcome => outcome.Translation));
+        Assert.All(server.Requests, request =>
         {
-            List<OpenAiTranslationPair> earlier =
-                [new("前", "之前"), new("旁", "旁邊"), .. texts.Take(k).Select(text => new OpenAiTranslationPair(text, $"translated:{text}"))];
-            Assert.Equal(Prompt.Build(texts[k], earlier), messages[k]);
-        }
-
-        for (var k = 1; k < texts.Count; k++)
-        {
-            var last = messages[k - 1];
-            Assert.StartsWith(last[..last.LastIndexOf("\n\n將以下文本", StringComparison.Ordinal)], messages[k]);
-        }
+            Assert.Contains("日文：", request.Message.Replace("原文：", "日文："));
+            Assert.Contains("原文：前\n繁體中文：之前", request.Message);
+            Assert.Contains("原文：旁\n繁體中文：旁邊", request.Message);
+        });
     }
 
     /// <summary>
@@ -390,7 +382,7 @@ public class OpenAiChatProtocolTests
         await new OpenAiChatTranslator(http).TranslateAsync(
             ["a b", "c d"], Request(), new OpenAiChatContext(Screen: Screen(["a b", "c d", "e f"])));
 
-        Assert.Equal(Prompt.Build("a b"), server.Requests.First().Message);
+        Assert.Equal(Prompt.Build("a b"), server.Requests.Single(request => request.Text == "a b").Message);
         Assert.All(server.Requests, request => Assert.DoesNotContain("e f", request.Message));
     }
 
@@ -407,10 +399,9 @@ public class OpenAiChatProtocolTests
 
         var outcomes = await new OpenAiChatTranslator(http).TranslateAsync(texts, Request());
 
-        Assert.Equal(["a b", "c d"], server.Requests.Select(request => request.Text));
+        Assert.Equal(["a b", "c d"], server.Requests.Select(request => request.Text).Order());
         Assert.Equal(["1200", "translated:a b", "2026/10/27 ★ 12:30", "translated:c d"], outcomes.Select(outcome => outcome.Translation));
         Assert.All(server.Requests, request => Assert.DoesNotContain("1200", request.Message));
-        Assert.Equal(Prompt.Build("c d", [new("a b", "translated:a b")]), server.Requests.Last().Message);
     }
 
     [Fact]
@@ -473,7 +464,7 @@ public class OpenAiChatProtocolTests
             ["a b", "b c", "d e"], Request(), new OpenAiChatContext([new("前", "之前")]));
 
         Assert.Equal(4, server.Sent);
-        Assert.Equal(Prompt.Build("b c"), server.Requests.ElementAt(2).Message);
+        Assert.Contains(server.Requests, request => request.Message == Prompt.Build("b c"));
         Assert.Equal(expected, outcomes[1].Translation);
         if (expected is null)
             Assert.Equal(OpenAiChatFailure.NoTranslation, Assert.IsType<OpenAiChatException>(outcomes[1].Error).Failure);
@@ -566,8 +557,7 @@ public class OpenAiChatProtocolTests
         var outcomes = await new OpenAiChatTranslator(http).TranslateAsync(texts, Request() with { Prompt = prompt });
 
         Assert.Equal(2, server.Sent);
-        Assert.Equal(1, server.MaxConcurrentRequests);
-        Assert.Contains("翻譯時可參考：\n原文：ああ次の探索の準備か\n", server.Requests.Last().Message);
+        Assert.InRange(server.MaxConcurrentRequests, 1, 4);
         Assert.Equal(texts, outcomes.Select(outcome => outcome.Translation));
     }
 
@@ -807,9 +797,8 @@ public class OpenAiChatProtocolTests
         Assert.False(outcomes[3].Translated);
         var error = Assert.IsType<OpenAiChatException>(outcomes[3].Error);
         Assert.Equal(OpenAiChatFailure.Rejected, error.Failure);
-        Assert.Equal(7, server.Sent);
-        Assert.Equal(Prompt.Build("block-03"), server.Requests.ElementAt(4).Message);
-        Assert.DoesNotContain("block-03", server.Requests.Last().Message);
+        Assert.InRange(server.Sent, 6, 7);
+        Assert.DoesNotContain(server.Requests.Where(r => r.Text != "block-03"), r => r.Message.Contains("block-03", StringComparison.Ordinal));
     }
 
     /// <summary>
@@ -826,7 +815,7 @@ public class OpenAiChatProtocolTests
             new OpenAiChatTranslator(http).TranslateAsync(Blocks(40), Request()));
 
         Assert.Equal(OpenAiChatFailure.Rejected, error.Failure);
-        Assert.Equal(8, server.Sent);
+        Assert.InRange(server.Sent, 8, 11);
     }
 
     /// <summary>

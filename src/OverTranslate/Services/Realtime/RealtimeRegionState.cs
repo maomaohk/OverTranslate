@@ -224,10 +224,15 @@ internal sealed class RealtimeRegionState
     /// <inheritdoc cref="FirstWaitAfterFailure"/>
     public static readonly TimeSpan LongestWaitAfterFailure = TimeSpan.FromSeconds(16);
 
+    public static readonly TimeSpan MinPollInterval = TimeSpan.FromMilliseconds(60);
+
     // Rounded to the nearest whole poll and never below one, because these are counted in polls
     // wherever they are used and a threshold of zero would mean "every poll".
     private static int PollsIn(TimeSpan interval) =>
         Math.Max(1, (int)Math.Round(interval / PollInterval));
+
+    private int PollsFor(TimeSpan interval) =>
+        Math.Max(1, (int)Math.Round(interval / _pollInterval));
 
     private static readonly IReadOnlyList<Rectangle> NoBands = [];
     private static readonly IReadOnlyList<RenderedLine> NoLines = [];
@@ -291,14 +296,27 @@ internal sealed class RealtimeRegionState
     /// </param>
     public RealtimeRegionState(
         RealtimeTextOrientation orientation = RealtimeTextOrientation.Horizontal,
-        int clearAfterEmptyReads = EmptyPassesBeforeClearing)
+        int clearAfterEmptyReads = EmptyPassesBeforeClearing,
+        TimeSpan? pollInterval = null)
     {
         _orientation = orientation;
         _clearAfterEmptyReads = Math.Max(1, clearAfterEmptyReads);
+        _pollInterval = pollInterval is { } custom
+            ? (custom < MinPollInterval ? MinPollInterval : custom)
+            : PollInterval;
+        _maxUnsettledPolls = Math.Max(1, PollsFor(SearchInterval) - 1);
+        _fullRescanPolls = PollsFor(FullRescanInterval);
+        _idleScanPolls = PollsFor(IdleScanInterval);
+        _longestHoldPolls = PollsFor(LongestHoldOverStillPicture);
     }
 
     // See EmptyPassesBeforeClearing; this block's own figure.
     private readonly int _clearAfterEmptyReads;
+    private readonly TimeSpan _pollInterval;
+    private readonly int _maxUnsettledPolls;
+    private readonly int _fullRescanPolls;
+    private readonly int _idleScanPolls;
+    private readonly int _longestHoldPolls;
 
     /// <summary>
     /// What the region shows, one entry per line, each with the score it was read at — so a later
@@ -468,7 +486,7 @@ internal sealed class RealtimeRegionState
     {
         if (!_stillPoll || _holdExpired || _emptyPasses == 0 || ShouldClearOverlay || !IsWatchingText)
             return false;
-        if (_pollsSinceReading < LongestHoldPolls) return false;
+        if (_pollsSinceReading < _longestHoldPolls) return false;
         _holdExpired = true;
         return true;
     }
@@ -528,7 +546,7 @@ internal sealed class RealtimeRegionState
             // that never holds still would never be read at all.
             var cap = IsWatchingText
                 ? textSettlePolls ?? (dialogue ? 0 : MaxTextUnsettledPolls)
-                : MaxUnsettledPolls;
+                : _maxUnsettledPolls;
             if (Changed(_pending) && _unsettledPolls < cap)
             {
                 _pending = current;
@@ -568,7 +586,7 @@ internal sealed class RealtimeRegionState
 
         // The text we know about is unchanged, but something may have appeared outside it, which no
         // view of the old lines can see.
-        if (++_pollsSinceFullScan < FullRescanPolls) return IdleScan(capture, null);
+        if (++_pollsSinceFullScan < _fullRescanPolls) return IdleScan(capture, null);
 
         _pollsSinceFullScan = 0;
         var full = capture(null);
@@ -612,7 +630,7 @@ internal sealed class RealtimeRegionState
     private RealtimeReadReason IdleScan(
         Func<IReadOnlyList<Rectangle>?, FrameFingerprint> capture, FrameFingerprint? full)
     {
-        if (_pollsSinceLook < IdleScanPolls) return RealtimeReadReason.Nothing;
+        if (_pollsSinceLook < _idleScanPolls) return RealtimeReadReason.Nothing;
 
         full ??= capture(null);
         if (!full.IsIdenticalTo(_recognised)) return RealtimeReadReason.TextChanged;
@@ -674,7 +692,7 @@ internal sealed class RealtimeRegionState
         _pollsSinceFailure++;
         var wait = TimeSpan.FromTicks(Math.Min(
             LongestWaitAfterFailure.Ticks, FirstWaitAfterFailure.Ticks << Math.Min(_failures - 1, 8)));
-        return _pollsSinceFailure < PollsIn(wait) && !capture(null).DiffersLocally(_failedOn);
+        return _pollsSinceFailure < PollsFor(wait) && !capture(null).DiffersLocally(_failedOn);
     }
 
     private void ClearFailure()

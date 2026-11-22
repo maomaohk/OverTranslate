@@ -39,7 +39,6 @@
          layer by default. None of them ship: DirectML.dll is downloaded with the manga models, the only thing
          that uses it (ocrmodels/manga-vertical.json, DirectMlDevice). onnxruntime.dll imports it delay-loaded,
          so nothing else ever asks for it. -->
-    <Microsoft_AI_DirectML_SkipLibraryCopy>true</Microsoft_AI_DirectML_SkipLibraryCopy>
     <Microsoft_AI_DirectML_SkipDebugLayerCopy>true</Microsoft_AI_DirectML_SkipDebugLayerCopy>
     <!-- The self-contained runtime brings WPF/WinForms resource satellites for 13 cultures (built-in dialog text,
          exception messages). Keep the ones matching the UI languages the app ships (Resources\Strings.*.xaml);

@@ -60,6 +60,8 @@ public partial class RealtimeBlockWindow : Window
 
     private const double MinFontSize = 8.5;
     private const double LineHeightRatio = 1.22;
+    private const double SubtitleHistoryGap = 6;
+    private static readonly TimeSpan SubtitleExpiryCheckInterval = TimeSpan.FromMilliseconds(200);
 
     /// <summary>
     /// How much of its square cell one glyph of vertical text is set at.
@@ -199,6 +201,20 @@ public partial class RealtimeBlockWindow : Window
     // drawn covers. Written once per Rebuild and never changed after, because the refresh reads it.
     private HashSet<int> _leftOut = [];
 
+    private readonly int _subtitleHoldMs;
+    private readonly int _subtitleMaxHistory;
+    private readonly List<SubtitleHistoryEntry> _subtitleHistory = [];
+    private readonly DispatcherTimer _subtitleExpiryTimer;
+    private bool _sourceActive;
+
+    internal sealed class SubtitleHistoryEntry(string keyText, IReadOnlyList<TranslatedBlock> rawLines, DateTime expiresAtUtc)
+    {
+        public string KeyText { get; } = keyText;
+        public IReadOnlyList<TranslatedBlock> RawLines { get; set; } = rawLines;
+        public IReadOnlyList<TranslatedBlock>? SettledLines { get; set; }
+        public DateTime ExpiresAtUtc { get; set; } = expiresAtUtc;
+    }
+
     /// <param name="grabUnderlying">
     /// Asks the session's capture backend for a screen rectangle. Required rather than optional:
     /// 進階選項 cannot be drawn without it, and a window that quietly fell back to reading the
@@ -239,7 +255,9 @@ public partial class RealtimeBlockWindow : Window
         System.Drawing.Point? displayLocation = null,
         double displayScale = 1.0,
         double? fixedFontSize = null,
-        RealtimeTextAlign? align = null)
+        RealtimeTextAlign? align = null,
+        int subtitleHoldMs = 0,
+        int subtitleMaxHistory = Models.RealtimeSettings.DefaultSubtitleMaxHistory)
     {
         InitializeComponent();
         // Shown again over a game after its source was covered (see the session controller's
@@ -249,6 +267,10 @@ public partial class RealtimeBlockWindow : Window
         _align = align ?? ResolvedProfile.ForLayout(mode).Align;
         _orientation = orientation;
         _fixedFontSize = fixedFontSize;
+        _subtitleHoldMs = Math.Clamp(subtitleHoldMs, Models.RealtimeSettings.MinSubtitleHoldMs, Models.RealtimeSettings.MaxSubtitleHoldMs);
+        _subtitleMaxHistory = Math.Clamp(subtitleMaxHistory, Models.RealtimeSettings.MinSubtitleMaxHistory, Models.RealtimeSettings.MaxSubtitleMaxHistory);
+        _subtitleExpiryTimer = new DispatcherTimer { Interval = SubtitleExpiryCheckInterval };
+        _subtitleExpiryTimer.Tick += (_, _) => PruneExpiredSubtitles(DateTime.UtcNow);
         _border = border;
         _fixedBorderBrush = border && borderColor is not null
             ? Freeze(new SolidColorBrush(RealtimeSubtitleColors.Border(borderColor)))
@@ -283,7 +305,11 @@ public partial class RealtimeBlockWindow : Window
         _scrimBrush = Freeze(new SolidColorBrush(
             RealtimeSubtitleColors.Scrim(scrimColor, scrimOpacity)));
 
-        Closed += (_, _) => StopNaturalRefresh();
+        Closed += (_, _) =>
+        {
+            StopNaturalRefresh();
+            ClearSubtitleHistory();
+        };
 
         Loaded += (_, _) =>
         {
@@ -356,9 +382,11 @@ public partial class RealtimeBlockWindow : Window
         if (_mode == layout && _align == align) return;
         _mode = layout;
         _align = align;
+        if (layout == RealtimeBlockMode.Panel) ClearSubtitleHistory();
 
         if (!_isLoaded) return;
         Rebuild();
+        UpdateNaturalRefreshTimer();
     }
 
     /// <summary>
@@ -382,6 +410,63 @@ public partial class RealtimeBlockWindow : Window
 
     public void SetLines(IReadOnlyList<TranslatedBlock> lines)
     {
+        if (_subtitleHoldMs > 0 && _orientation == RealtimeTextOrientation.Horizontal && _mode != RealtimeBlockMode.Panel)
+        {
+            var visible = lines.Where(line => !line.Hidden && !string.IsNullOrWhiteSpace(line.TranslatedText)).ToList();
+            if (visible.Count == 0)
+            {
+                if (_mode == RealtimeBlockMode.Subtitle || _subtitleHistory.Count > 0)
+                {
+                    var wasSourceActive = _sourceActive;
+                    _sourceActive = false;
+                    _lines = lines;
+                    if (wasSourceActive && _naturalBackground && _isLoaded)
+                    {
+                        Rebuild();
+                        UpdateNaturalRefreshTimer();
+                    }
+                    return;
+                }
+            }
+            else if (visible.All(block => block.Tilt is null && (_mode == RealtimeBlockMode.Auto ? block.ReadAs != RealtimeBlockMode.Panel : true)))
+            {
+                var expiresAt = DateTime.UtcNow.AddMilliseconds(_subtitleHoldMs);
+                var keyText = string.Join('\n', visible.Select(line => line.TranslatedText));
+                if (_subtitleHistory.Count > 0 && string.Equals(_subtitleHistory[^1].KeyText, keyText, StringComparison.Ordinal))
+                {
+                    _subtitleHistory[^1].ExpiresAtUtc = expiresAt;
+                    _sourceActive = true;
+                    if (_isLoaded && LooksIdentical(_lines, lines)) return;
+                    _subtitleHistory[^1].RawLines = lines;
+                    _subtitleHistory[^1].SettledLines = null;
+                }
+                else
+                {
+                    _sourceActive = true;
+                    _subtitleHistory.Add(new SubtitleHistoryEntry(keyText, lines, expiresAt));
+                    while (_subtitleHistory.Count > _subtitleMaxHistory)
+                        _subtitleHistory.RemoveAt(0);
+                }
+
+                _lines = lines;
+                _subtitleExpiryTimer.Start();
+                if (_isLoaded)
+                {
+                    Rebuild();
+                    UpdateNaturalRefreshTimer();
+                }
+                return;
+            }
+            else
+            {
+                ClearSubtitleHistory();
+            }
+        }
+        else if (_subtitleHistory.Count > 0)
+        {
+            ClearSubtitleHistory();
+        }
+
         // A rebuild cross-fades, so repainting an unchanged overlay is a visible flicker for no
         // gain. The session already suppresses re-translation of text that has not really changed;
         // this catches what is left — the same translation arriving with its boxes a pixel or two
@@ -390,6 +475,71 @@ public partial class RealtimeBlockWindow : Window
 
         _lines = lines;
         if (_isLoaded)
+        {
+            Rebuild();
+            UpdateNaturalRefreshTimer();
+        }
+    }
+
+    public void Clear()
+    {
+        ClearSubtitleHistory();
+        _lines = [];
+        if (_isLoaded)
+        {
+            Rebuild();
+            UpdateNaturalRefreshTimer();
+        }
+    }
+
+    internal bool IsSourceActive => _sourceActive;
+
+    internal IReadOnlyList<SubtitleHistoryEntry> SnapshotSubtitleHistory() => [.. _subtitleHistory];
+
+    internal void RestoreSubtitleHistory(IReadOnlyList<SubtitleHistoryEntry> history, bool sourceActive)
+    {
+        if (_subtitleHoldMs <= 0 || history.Count == 0) return;
+        _subtitleHistory.Clear();
+        _subtitleHistory.AddRange(history);
+        _sourceActive = sourceActive;
+        _subtitleExpiryTimer.Start();
+        if (_isLoaded)
+        {
+            Rebuild();
+            UpdateNaturalRefreshTimer();
+        }
+    }
+
+    private void ClearSubtitleHistory()
+    {
+        _subtitleHistory.Clear();
+        _sourceActive = false;
+        _subtitleExpiryTimer.Stop();
+    }
+
+    internal void PruneExpiredSubtitles(DateTime utcNow)
+    {
+        if (_subtitleHistory.Count == 0)
+        {
+            _subtitleExpiryTimer.Stop();
+            return;
+        }
+
+        int checkLimit = _sourceActive ? _subtitleHistory.Count - 1 : _subtitleHistory.Count;
+        bool changed = false;
+        for (int i = checkLimit - 1; i >= 0; i--)
+        {
+            if (_subtitleHistory[i].ExpiresAtUtc <= utcNow)
+            {
+                _subtitleHistory.RemoveAt(i);
+                changed = true;
+            }
+        }
+
+        if (_subtitleHistory.Count == 0)
+            _subtitleExpiryTimer.Stop();
+
+        if (changed && _isLoaded)
         {
             Rebuild();
             UpdateNaturalRefreshTimer();
@@ -494,38 +644,46 @@ public partial class RealtimeBlockWindow : Window
         // line was read in, and a band sized from the box left it showing (see CoverOverhang). Null
         // is as ordinary here as anywhere else (see CaptureUnderlyingRegion), and the band is then
         // sized from the boxes alone, as it always was.
-        using var frame = CaptureUnderlyingRegion();
+        using var frame = _subtitleHistory.Count == 0 || _sourceActive ? CaptureUnderlyingRegion() : null;
 
-        // 固定 has no use for it: the size is the reader's, and the boxes stay as they were read.
-        _layoutLines = _fixedFontSize is null
-            ? _textSizes.Settle(_lines, _orientation == RealtimeTextOrientation.Vertical)
-            : _lines;
-        LogSteadiedHeights();
-
-        // Measured once for every block, and only if a band asks — see OverhangOf.
-        _overhangs = new Lazy<Dictionary<TranslatedBlock, System.Drawing.Rectangle>>(() => MeasureOverhangs(frame));
-
-        // The hidden lines are left out (TranslatedBlock.Hidden) — except one that something drawn
-        // would cover. A band set as a subtitle is as wide as its translation, and reaches across
-        // whatever sits beside its line; with the line beside it drawn too, the later of the two is
-        // on top, and a number to the right of a sentence was read as its own box over the band.
-        // Left out, it would be under the band with nothing over it, and the reader would lose the
-        // very number the hiding was meant to leave on show. So it is drawn as it always was.
-        // Covered means covered enough that it could no longer be read (see HidesRow): a box that
-        // only reaches into the margin of the row below leaves that row's figures as they are.
-        HashSet<int> leftOut = [.. Enumerable.Range(0, _lines.Count).Where(index => _lines[index].Hidden)];
-        var visuals = BuildVisuals(canvasWidth, canvasHeight, frame, leftOut).ToList();
-        if (leftOut.Count > 0)
+        List<LineVisual> visuals;
+        if (_subtitleHistory.Count > 0)
         {
-            var covered = leftOut.Where(index => visuals.Any(visual => Covers(visual, _lines[index]))).ToList();
-            if (covered.Count > 0)
-            {
-                leftOut.ExceptWith(covered);
-                visuals = BuildVisuals(canvasWidth, canvasHeight, frame, leftOut).ToList();
-            }
+            visuals = BuildSubtitleHistoryVisuals(canvasWidth, canvasHeight, frame);
         }
-        // Read by the refresh off this thread, so it is handed a set nothing changes afterwards.
-        Volatile.Write(ref _leftOut, leftOut);
+        else
+        {
+            // 固定 has no use for it: the size is the reader's, and the boxes stay as they were read.
+            _layoutLines = _fixedFontSize is null
+                ? _textSizes.Settle(_lines, _orientation == RealtimeTextOrientation.Vertical)
+                : _lines;
+            LogSteadiedHeights();
+
+            // Measured once for every block, and only if a band asks — see OverhangOf.
+            _overhangs = new Lazy<Dictionary<TranslatedBlock, System.Drawing.Rectangle>>(() => MeasureOverhangs(frame));
+
+            // The hidden lines are left out (TranslatedBlock.Hidden) — except one that something drawn
+            // would cover. A band set as a subtitle is as wide as its translation, and reaches across
+            // whatever sits beside its line; with the line beside it drawn too, the later of the two is
+            // on top, and a number to the right of a sentence was read as its own box over the band.
+            // Left out, it would be under the band with nothing over it, and the reader would lose the
+            // very number the hiding was meant to leave on show. So it is drawn as it always was.
+            // Covered means covered enough that it could no longer be read (see HidesRow): a box that
+            // only reaches into the margin of the row below leaves that row's figures as they are.
+            HashSet<int> leftOut = [.. Enumerable.Range(0, _lines.Count).Where(index => _lines[index].Hidden)];
+            visuals = BuildVisuals(canvasWidth, canvasHeight, frame, leftOut).ToList();
+            if (leftOut.Count > 0)
+            {
+                var covered = leftOut.Where(index => visuals.Any(visual => Covers(visual, _lines[index]))).ToList();
+                if (covered.Count > 0)
+                {
+                    leftOut.ExceptWith(covered);
+                    visuals = BuildVisuals(canvasWidth, canvasHeight, frame, leftOut).ToList();
+                }
+            }
+            // Read by the refresh off this thread, so it is handed a set nothing changes afterwards.
+            Volatile.Write(ref _leftOut, leftOut);
+        }
 
         var boxes = new List<List<FrameworkElement>>();
         foreach (var visual in visuals)
@@ -541,7 +699,7 @@ public partial class RealtimeBlockWindow : Window
             // Only the repaired backgrounds are worth revisiting: a band drawn in a fixed colour has
             // nothing to follow, and recording one here would have the refresh below replace it with
             // a patch the user never asked for.
-            if (_naturalBackground)
+            if (_naturalBackground && !visual.IsHistorical)
                 patches.Add(new NaturalPatchVisual(background, visual.PatchBounds, visual.Replate));
         }
 
@@ -589,9 +747,121 @@ public partial class RealtimeBlockWindow : Window
     /// <param name="JoinsPrevious">
     /// A panel row after the first: one box with the rows before it, under their shared patch.
     /// </param>
+    private IReadOnlyList<TranslatedBlock> ResolveHistoryLines(SubtitleHistoryEntry entry)
+    {
+        if (_fixedFontSize is not null) return entry.RawLines;
+        return entry.SettledLines ??= _textSizes.Settle(entry.RawLines, false);
+    }
+
+    private List<LineVisual> BuildSubtitleHistoryVisuals(
+        double canvasWidth, double canvasHeight, System.Drawing.Bitmap? frame)
+    {
+        var newestEntry = _subtitleHistory[^1];
+        List<LineVisual> newestVisuals;
+        if (_sourceActive)
+        {
+            _layoutLines = ResolveHistoryLines(newestEntry);
+            LogSteadiedHeights();
+            _overhangs = new Lazy<Dictionary<TranslatedBlock, System.Drawing.Rectangle>>(() => MeasureOverhangs(frame));
+
+            HashSet<int> leftOut = [.. Enumerable.Range(0, _lines.Count).Where(index => _lines[index].Hidden)];
+            newestVisuals = BuildVisuals(canvasWidth, canvasHeight, frame, leftOut).ToList();
+            if (leftOut.Count > 0)
+            {
+                var covered = leftOut.Where(index => newestVisuals.Any(visual => Covers(visual, _lines[index]))).ToList();
+                if (covered.Count > 0)
+                {
+                    leftOut.ExceptWith(covered);
+                    newestVisuals = BuildVisuals(canvasWidth, canvasHeight, frame, leftOut).ToList();
+                }
+            }
+            Volatile.Write(ref _leftOut, leftOut);
+        }
+        else
+        {
+            _overhangs = null;
+            Volatile.Write(ref _leftOut, []);
+            newestVisuals = BuildHistoricalEntryVisuals(newestEntry, canvasWidth, canvasHeight);
+        }
+
+        if (_subtitleHistory.Count == 1 || newestVisuals.Count == 0)
+            return newestVisuals;
+
+        var chunks = new List<List<LineVisual>>(_subtitleHistory.Count) { newestVisuals };
+        double occupiedTop = VisualsTop(newestVisuals);
+
+        for (int i = _subtitleHistory.Count - 2; i >= 0; i--)
+        {
+            var entryVisuals = BuildHistoricalEntryVisuals(_subtitleHistory[i], canvasWidth, canvasHeight);
+            if (entryVisuals.Count == 0) continue;
+
+            double entryTop = VisualsTop(entryVisuals);
+            double entryBottom = VisualsBottom(entryVisuals);
+            double targetBottom = occupiedTop - SubtitleHistoryGap;
+            double targetTop = targetBottom - (entryBottom - entryTop);
+            if (targetTop < 0) break;
+
+            double deltaY = targetTop - entryTop;
+            foreach (var visual in entryVisuals)
+            {
+                if (visual.Background is { } bg)
+                    Canvas.SetTop(bg, Canvas.GetTop(bg) + deltaY);
+                Canvas.SetTop(visual.Text, Canvas.GetTop(visual.Text) + deltaY);
+            }
+
+            occupiedTop = targetTop;
+            chunks.Add(entryVisuals);
+        }
+
+        var flattened = new List<LineVisual>();
+        for (int i = chunks.Count - 1; i >= 0; i--)
+            flattened.AddRange(chunks[i]);
+        return flattened;
+    }
+
+    private List<LineVisual> BuildHistoricalEntryVisuals(
+        SubtitleHistoryEntry entry, double canvasWidth, double canvasHeight)
+    {
+        var lines = ResolveHistoryLines(entry);
+        var result = new List<LineVisual>();
+        foreach (var block in lines)
+        {
+            if (block.Hidden || string.IsNullOrWhiteSpace(block.TranslatedText)) continue;
+            if (BuildLine(block, canvasWidth, canvasHeight, null, null,
+                    RealtimeSourceAlignment.For(_align, RealtimeBlockMode.Subtitle, block.SourceLineBounds)) is { } visual)
+                result.Add(visual with { IsHistorical = true });
+        }
+        return result;
+    }
+
+    private static double VisualsTop(IReadOnlyList<LineVisual> visuals)
+    {
+        double min = double.PositiveInfinity;
+        foreach (var visual in visuals)
+        {
+            min = Math.Min(min, Canvas.GetTop(visual.Text));
+            if (visual.Background is { } bg)
+                min = Math.Min(min, Canvas.GetTop(bg));
+        }
+        return min;
+    }
+
+    private static double VisualsBottom(IReadOnlyList<LineVisual> visuals)
+    {
+        double max = double.NegativeInfinity;
+        foreach (var visual in visuals)
+        {
+            max = Math.Max(max, Canvas.GetTop(visual.Text) + visual.Text.Height);
+            if (visual.Background is { } bg)
+                max = Math.Max(max, Canvas.GetTop(bg) + bg.Height);
+        }
+        return max;
+    }
+
     private readonly record struct LineVisual(
         Border? Background, Border Text, System.Drawing.Rectangle PatchBounds,
-        Func<CaptureBubbleBackdrop, System.Windows.Media.Brush?>? Replate = null, bool JoinsPrevious = false);
+        Func<CaptureBubbleBackdrop, System.Windows.Media.Brush?>? Replate = null, bool JoinsPrevious = false,
+        bool IsHistorical = false);
 
     /// <param name="Replate">
     /// How a vertical line's plate is painted again from a new repair; null for a patch that is a

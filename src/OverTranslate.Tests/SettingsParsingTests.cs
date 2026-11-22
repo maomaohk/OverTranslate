@@ -1162,4 +1162,24 @@ public class SettingsParsingTests
         Assert.False(annotation.TextUnderline);
         Assert.True(annotation.TextStrikethrough);
     }
+
+    [Fact]
+    public void SubtitleHistorySettings_DefaultAndClamp()
+    {
+        var defaults = SettingsService.Parse("{}");
+        Assert.Equal(RealtimeSettings.DefaultSubtitleHoldMs, defaults.Realtime.SubtitleHoldMs);
+        Assert.Equal(RealtimeSettings.DefaultSubtitleMaxHistory, defaults.Realtime.SubtitleMaxHistory);
+
+        var clampedLow = SettingsService.Parse("""{"Realtime":{"SubtitleHoldMs":-100,"SubtitleMaxHistory":0}}""");
+        Assert.Equal(RealtimeSettings.MinSubtitleHoldMs, clampedLow.Realtime.SubtitleHoldMs);
+        Assert.Equal(RealtimeSettings.MinSubtitleMaxHistory, clampedLow.Realtime.SubtitleMaxHistory);
+
+        var clampedHigh = SettingsService.Parse("""{"Realtime":{"SubtitleHoldMs":99999,"SubtitleMaxHistory":99}}""");
+        Assert.Equal(RealtimeSettings.MaxSubtitleHoldMs, clampedHigh.Realtime.SubtitleHoldMs);
+        Assert.Equal(RealtimeSettings.MaxSubtitleMaxHistory, clampedHigh.Realtime.SubtitleMaxHistory);
+
+        var valid = SettingsService.Parse("""{"Realtime":{"SubtitleHoldMs":4500,"SubtitleMaxHistory":5}}""");
+        Assert.Equal(4500, valid.Realtime.SubtitleHoldMs);
+        Assert.Equal(5, valid.Realtime.SubtitleMaxHistory);
+    }
 }

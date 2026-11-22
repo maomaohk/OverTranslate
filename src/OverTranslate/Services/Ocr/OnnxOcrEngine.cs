@@ -87,13 +87,17 @@ internal sealed class OnnxOcrEngine : IOcrEngine
 
     private readonly object _sync = new();
     // Admits a bounded number of concurrent inferences; see RecognizeAsync for why it is bounded.
-    private readonly SemaphoreSlim _inferenceGate = new(InferenceSlots, InferenceSlots);
+    private SemaphoreSlim _inferenceGate = new(InferenceSlots, InferenceSlots);
     private readonly System.Threading.Timer _idleReleaseTimer;
     private RapidOcrRuntime? _current;
     // Written under _sync; volatile so the UI thread can ask what is loaded without waiting out a
     // load that holds the lock.
     private volatile string? _currentModelKey;
     private volatile bool _loading;
+    private bool _useGpu;
+    private string _customModelDir = "";
+    private int _configVersion;
+    private int _currentConfigVersion;
     // Number of Detect calls currently running against _current. Inference runs OUTSIDE _sync
     // (it is slow and must not block other work or the timer), so the idle timer must never
     // dispose a runtime while this is > 0 — that would free the native ONNX sessions mid-
@@ -160,8 +164,33 @@ internal sealed class OnnxOcrEngine : IOcrEngine
         }
     }
 
+    internal void Configure(bool useGpu, string? customModelDir)
+    {
+        var normalizedDir = string.IsNullOrWhiteSpace(customModelDir) ? "" : customModelDir.Trim();
+        lock (_sync)
+        {
+            if (_disposed) return;
+            if (_useGpu == useGpu && string.Equals(_customModelDir, normalizedDir, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            _useGpu = useGpu;
+            _customModelDir = normalizedDir;
+            _configVersion++;
+
+            var slots = useGpu ? 1 : InferenceSlots;
+            Volatile.Write(ref _inferenceGate, new SemaphoreSlim(slots, slots));
+
+            if (_inUse == 0)
+                DisposeCurrentRuntime();
+        }
+    }
+
     /// <summary>Whether the model for the language is in memory; does not wait for a load under way.</summary>
-    internal bool IsLoaded(string sourceLanguage) => _currentModelKey == GetModelKeyForLanguage(sourceLanguage);
+    internal bool IsLoaded(string sourceLanguage)
+    {
+        lock (_sync)
+            return _current is not null && _currentModelKey == GetModelKeyForLanguage(sourceLanguage) && _currentConfigVersion == _configVersion;
+    }
 
     /// <summary>Whether a model is being loaded right now.</summary>
     internal bool IsLoading => _loading;
@@ -196,13 +225,14 @@ internal sealed class OnnxOcrEngine : IOcrEngine
         if (!OcrLanguageRouter.IsSupported(sourceLanguage))
             throw new NotSupportedException(OcrLanguageRouter.GetUnsupportedLanguageMessage(sourceLanguage));
 
+        var gate = Volatile.Read(ref _inferenceGate);
         return Task.Run(async () =>
         {
             // Bounded, not unlimited. Each inference already uses ThreadCount threads, so past the
             // slot count concurrent passes only split the same cores between themselves: overlapping
             // captures (frame it wrong, Esc, frame again) used to pile up that way and starve the
             // one the user was actually waiting for.
-            await _inferenceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
                 // Checked after the gate, not before: by the time an abandoned request reaches the
@@ -215,7 +245,7 @@ internal sealed class OnnxOcrEngine : IOcrEngine
             }
             finally
             {
-                _inferenceGate.Release();
+                gate.Release();
             }
         }, cancellationToken);
     }
@@ -230,11 +260,12 @@ internal sealed class OnnxOcrEngine : IOcrEngine
         if (!OcrLanguageRouter.IsSupported(sourceLanguage))
             throw new NotSupportedException(OcrLanguageRouter.GetUnsupportedLanguageMessage(sourceLanguage));
 
+        var gate = Volatile.Read(ref _inferenceGate);
         return Task.Run<List<OcrTextBlock>?>(() =>
         {
             // Inside the lambda, not before it: Task.Run with an already-cancelled token never runs
             // the body, so a slot taken out here would never be given back.
-            if (!_inferenceGate.Wait(0, cancellationToken))
+            if (!gate.Wait(0, cancellationToken))
                 return null;
 
             try
@@ -244,21 +275,26 @@ internal sealed class OnnxOcrEngine : IOcrEngine
             }
             finally
             {
-                _inferenceGate.Release();
+                gate.Release();
             }
         }, cancellationToken);
     }
 
-    public IOcrSlot? TryTakeSlot() => _inferenceGate.Wait(0) ? new Slot(this) : null;
+    public IOcrSlot? TryTakeSlot()
+    {
+        var gate = Volatile.Read(ref _inferenceGate);
+        return gate.Wait(0) ? new Slot(this, gate) : null;
+    }
 
     public async Task<IOcrSlot> TakeSlotAsync(CancellationToken cancellationToken)
     {
-        await _inferenceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        return new Slot(this);
+        var gate = Volatile.Read(ref _inferenceGate);
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return new Slot(this, gate);
     }
 
     /// <summary>One of <see cref="_inferenceGate"/>'s slots, given back once, when disposed.</summary>
-    private sealed class Slot(OnnxOcrEngine owner) : IOcrSlot
+    private sealed class Slot(OnnxOcrEngine owner, SemaphoreSlim gate) : IOcrSlot
     {
         private int _released;
 
@@ -279,7 +315,7 @@ internal sealed class OnnxOcrEngine : IOcrEngine
 
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _released, 1) == 0) owner._inferenceGate.Release();
+            if (Interlocked.Exchange(ref _released, 1) == 0) gate.Release();
         }
     }
 
@@ -444,9 +480,10 @@ internal sealed class OnnxOcrEngine : IOcrEngine
         if (!OcrLanguageRouter.IsSupported(sourceLanguage))
             throw new NotSupportedException(OcrLanguageRouter.GetUnsupportedLanguageMessage(sourceLanguage));
 
+        var gate = Volatile.Read(ref _inferenceGate);
         return Task.Run<IReadOnlyList<System.Windows.Rect>?>(() =>
         {
-            if (!_inferenceGate.Wait(0, cancellationToken))
+            if (!gate.Wait(0, cancellationToken))
                 return null;
 
             try
@@ -459,7 +496,7 @@ internal sealed class OnnxOcrEngine : IOcrEngine
             }
             finally
             {
-                _inferenceGate.Release();
+                gate.Release();
             }
         }, cancellationToken);
     }
@@ -1179,7 +1216,7 @@ internal sealed class OnnxOcrEngine : IOcrEngine
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            if (_current is not null && _currentModelKey == modelKey)
+            if (_current is not null && _currentModelKey == modelKey && _currentConfigVersion == _configVersion)
             {
                 _inUse++;
                 return _current;
@@ -1199,7 +1236,7 @@ internal sealed class OnnxOcrEngine : IOcrEngine
                 ObjectDisposedException.ThrowIf(_disposed, this);
 
                 // Whoever we were waiting for may have loaded the model we wanted in the meantime.
-                if (_current is not null && _currentModelKey == modelKey)
+                if (_current is not null && _currentModelKey == modelKey && _currentConfigVersion == _configVersion)
                 {
                     _inUse++;
                     return _current;
@@ -1212,11 +1249,15 @@ internal sealed class OnnxOcrEngine : IOcrEngine
             _current = null;
             _currentModelKey = null;
 
+            var useGpu = _useGpu;
+            var customDir = _customModelDir;
+            var targetVersion = _configVersion;
+
             RapidOcrRuntime runtime;
             _loading = true;
             try
             {
-                runtime = CreateRuntime(modelKey);
+                runtime = CreateRuntime(modelKey, useGpu, customDir);
             }
             finally
             {
@@ -1225,6 +1266,7 @@ internal sealed class OnnxOcrEngine : IOcrEngine
 
             _current = runtime;
             _currentModelKey = modelKey;
+            _currentConfigVersion = targetVersion;
             _inUse++;
             return runtime;
         }
@@ -1372,7 +1414,39 @@ internal sealed class OnnxOcrEngine : IOcrEngine
     /// the two models answer different questions — whether text was found at all, and whether it
     /// was read correctly — and moving both at once makes neither answer attributable.
     /// </remarks>
-    private static RapidOcrRuntime CreateRuntime(string modelName)
+    private static RapidOcrRuntime CreateRuntime(string modelName, bool useGpu, string customModelDir)
+    {
+        var builtinSet = BuildBuiltinModelSet(modelName);
+        var modelSet = builtinSet;
+        var usingCustom = false;
+
+        if (!string.IsNullOrEmpty(customModelDir))
+        {
+            if (TryResolveCustomModelSet(customModelDir, builtinSet.ClsModelPath, out var customSet))
+            {
+                modelSet = customSet;
+                usingCustom = true;
+            }
+            else
+            {
+                Log.Warn("Custom ONNX OCR directory is incomplete or missing ({Dir}); falling back to built-in model {Model}",
+                    customModelDir, modelName);
+            }
+        }
+
+        try
+        {
+            return new RapidOcrRuntime(modelName, InitRapidOcr(modelSet, useGpu));
+        }
+        catch (Exception ex) when (usingCustom)
+        {
+            Log.Warn(ex, "Custom ONNX OCR model failed to load from {Dir}; falling back to built-in model {Model}",
+                customModelDir, modelName);
+            return new RapidOcrRuntime(modelName, InitRapidOcr(builtinSet, useGpu));
+        }
+    }
+
+    private static RapidOcrModelSet BuildBuiltinModelSet(string modelName)
     {
         var sharedPath = Path.Combine(ModelRoot, "shared");
         var modelPath = Path.Combine(ModelRoot, modelName);
@@ -1403,26 +1477,147 @@ internal sealed class OnnxOcrEngine : IOcrEngine
                 string.Join(",", detector.Mean));
         }
 
-        var engine = new RapidOcr();
+        return new RapidOcrModelSet
+        {
+            DetModelPath = detector.Path,
+            ClsModelPath = clsPath,
+            RecModelPath = recPath,
+            KeysPath = dictPath,
+            DetMean = detector.Mean,
+            DetStd = detector.Std,
+        };
+    }
 
-        // The model-set overload rather than the four-path one, because it is the only one that
-        // carries the detector's normalisation — and the shipped detector is no longer from the
-        // same family as the library's default. Verified equivalent before the swap: loaded this
-        // way with the old detector and the ImageNet statistics, a sweep of two frames across all
-        // fifteen sizes reproduced the four-path result line for line.
-        engine.InitModels(
-            new RapidOcrModelSet
+    private static bool TryResolveCustomModelSet(
+        string customDir, string fallbackClsPath, out RapidOcrModelSet modelSet)
+    {
+        modelSet = null!;
+        if (!Directory.Exists(customDir)) return false;
+
+        var detPath = FindFirstFile(customDir, "det*.onnx");
+        var recPath = FindFirstFile(customDir, "rec*.onnx");
+        var clsPath = FindFirstFile(customDir, "cls*.onnx") ?? fallbackClsPath;
+        var dictPath = FindFirstFile(customDir, "dict*.txt") ?? FindFirstFile(customDir, "*keys*.txt");
+
+        if (detPath is null || recPath is null || dictPath is null)
+            return false;
+
+        var detName = Path.GetFileName(detPath);
+        var useImageNet = detName.Contains("v3", StringComparison.OrdinalIgnoreCase)
+            || detName.Contains("v4", StringComparison.OrdinalIgnoreCase)
+            || detName.Contains("v5", StringComparison.OrdinalIgnoreCase);
+
+        Log.Info("Using custom ONNX OCR models from {Dir}: det={Det}, rec={Rec}, dict={Dict}",
+            customDir, Path.GetFileName(detPath), Path.GetFileName(recPath), Path.GetFileName(dictPath));
+
+        modelSet = new RapidOcrModelSet
+        {
+            DetModelPath = detPath,
+            ClsModelPath = clsPath,
+            RecModelPath = recPath,
+            KeysPath = dictPath,
+            DetMean = useImageNet ? ImageNetNormalization : HalfNormalization,
+            DetStd = useImageNet ? ImageNetNormalizationStd : HalfNormalization,
+        };
+        return true;
+    }
+
+    private static string? FindFirstFile(string dir, string pattern)
+    {
+        try
+        {
+            return Directory.EnumerateFiles(dir, pattern, SearchOption.TopDirectoryOnly)
+                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault()
+                ?? Directory.EnumerateFiles(dir, pattern, SearchOption.AllDirectories)
+                    .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private static RapidOcr InitRapidOcr(RapidOcrModelSet modelSet, bool useGpu)
+    {
+        if (useGpu && TryCreateDirectMlSessionOptions(out var dmlOptions, out var adapterName))
+        {
+            var gpuEngine = new RapidOcr();
+            try
             {
-                DetModelPath = detector.Path,
-                ClsModelPath = clsPath,
-                RecModelPath = recPath,
-                KeysPath = dictPath,
-                DetMean = detector.Mean,
-                DetStd = detector.Std,
-            },
-            ThreadCount);
+                using (dmlOptions)
+                    gpuEngine.InitModels(modelSet, dmlOptions!);
+                Log.Info("ONNX OCR initialized with DirectML GPU acceleration on {Adapter}", adapterName);
+                return gpuEngine;
+            }
+            catch (Exception ex) when (ex is Microsoft.ML.OnnxRuntime.OnnxRuntimeException
+                                       or EntryPointNotFoundException
+                                       or DllNotFoundException
+                                       or InvalidOperationException
+                                       or IOException)
+            {
+                gpuEngine.Dispose();
+                Log.Warn(ex, "DirectML GPU initialization failed for ONNX OCR on {Adapter}; falling back to CPU", adapterName);
+            }
+        }
 
-        return new RapidOcrRuntime(modelName, engine);
+        var cpuEngine = new RapidOcr();
+        cpuEngine.InitModels(modelSet, ThreadCount);
+        return cpuEngine;
+    }
+
+    private static bool TryCreateDirectMlSessionOptions(
+        out Microsoft.ML.OnnxRuntime.SessionOptions? options, out string adapterName)
+    {
+        options = null;
+        adapterName = "";
+
+        var (chosen, reason) = DirectMlDevice.Choose();
+        if (chosen is not { } adapter)
+        {
+            Log.Warn("ONNX OCR DirectML GPU unavailable ({Reason}); falling back to CPU", reason);
+            return false;
+        }
+
+        if (DirectMlDevice.Direct3D12Problem(adapter) is { } d3dProblem)
+        {
+            Log.Warn("ONNX OCR DirectML GPU unavailable ({Reason}); falling back to CPU", d3dProblem);
+            return false;
+        }
+
+        var runtimeProblem = DirectMlDevice.LoadBundledOrFallback(
+            AppServices.MangaModels.RuntimePath,
+            AppServices.MangaModels.Manifest?.DirectMl?.Files[0]);
+        if (runtimeProblem is not null)
+        {
+            Log.Warn("ONNX OCR DirectML runtime unavailable ({Reason}); falling back to CPU", runtimeProblem);
+            return false;
+        }
+
+        var sessionOptions = new Microsoft.ML.OnnxRuntime.SessionOptions
+        {
+            GraphOptimizationLevel = Microsoft.ML.OnnxRuntime.GraphOptimizationLevel.ORT_ENABLE_ALL,
+            EnableMemoryPattern = false,
+            ExecutionMode = Microsoft.ML.OnnxRuntime.ExecutionMode.ORT_SEQUENTIAL,
+            LogSeverityLevel = Microsoft.ML.OnnxRuntime.OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR,
+        };
+        try
+        {
+            sessionOptions.AppendExecutionProvider_DML(adapter.Index);
+            options = sessionOptions;
+            adapterName = adapter.Name;
+            return true;
+        }
+        catch (Exception ex) when (ex is Microsoft.ML.OnnxRuntime.OnnxRuntimeException
+                                   or EntryPointNotFoundException
+                                   or DllNotFoundException
+                                   or InvalidOperationException)
+        {
+            sessionOptions.Dispose();
+            Log.Warn(ex, "Failed to attach DirectML execution provider for ONNX OCR; falling back to CPU");
+            return false;
+        }
     }
 
     // Default ImgResize (1024) downscales wide UI screenshots and destroys small-text detail,
