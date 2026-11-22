@@ -5,6 +5,7 @@ using NLog;
 using OverTranslate.Services.Ocr;
 using OverTranslate.Services.Providers;
 using OverTranslate.Services.Realtime.Capture;
+using OverTranslate.Translation.OpenAi;
 
 namespace OverTranslate.Services.Realtime;
 
@@ -87,6 +88,7 @@ public sealed class RealtimeTranslationSession
     private TimeSpan _pollInterval = PollInterval;
     private TimeSpan _minTranslationInterval = TimeSpan.Zero;
     private int _maxConcurrentTranslations = MaxConcurrentTranslations;
+    private int _subtitleHoldMs;
     private long _lastTranslationRequestAt;
 
     // A session-wide failure — a missing API key, a provider that is down — reaches every region at
@@ -206,13 +208,20 @@ public sealed class RealtimeTranslationSession
         bool warmUp = true,
         int? pollIntervalMs = null,
         int? minTranslationIntervalMs = null,
-        int? maxConcurrentTranslations = null)
+        int? maxConcurrentTranslations = null,
+        int? subtitleHoldMs = null)
     {
         // Not the public Stop: this one is the tail of the previous run only when there was one,
         // and 繼續 comes through here with the same backend it is about to keep using. Reporting on
         // it now would put a partial total in the log every time the user unpauses, and the line is
         // supposed to be the closing summary of one run of translating.
         Stop(releaseRecogniser: false, reportCapture: false);
+
+        if (subtitleHoldMs is { } holdMs)
+            _subtitleHoldMs = Math.Clamp(
+                holdMs,
+                Models.RealtimeSettings.MinSubtitleHoldMs,
+                Models.RealtimeSettings.MaxSubtitleHoldMs);
 
         if (pollIntervalMs is { } pollMs)
             _pollInterval = TimeSpan.FromMilliseconds(Math.Clamp(
@@ -810,6 +819,8 @@ public sealed class RealtimeTranslationSession
                 // RealtimeGate: detection alone at a third of the size, which turns away three
                 // quarters of the empty frames for a fifth of what the pass behind it costs, and is
                 // what lets those timers run several times as often as they used to.
+                var highPriority = state.ReadsAs(region.Profile.Layout) == RealtimeBlockMode.Subtitle;
+
                 if (reason != RealtimeReadReason.TextChanged
                     && _ocr.SupportsDetectionGate
                     && RealtimeGate.WorthGating(frame.Width, frame.Height))
@@ -821,7 +832,7 @@ public sealed class RealtimeTranslationSession
                     try
                     {
                         found = await _ocr.TryDetectTextAsync(
-                            frame, sourceLanguage, gateSize, RealtimeGate.MinimumScore, token);
+                            frame, sourceLanguage, gateSize, RealtimeGate.MinimumScore, token, highPriority);
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
@@ -1085,11 +1096,12 @@ public sealed class RealtimeTranslationSession
         var sameAsLastRead = confirmation == ConfirmationRead.ReuseLastRead;
         if (readingAgain) primarySize = otherSize!.Value;
 
+        var highPriority = state.ReadsAs(region.Profile.Layout) == RealtimeBlockMode.Subtitle;
         var modelsLoading = _ocr.IsLoadingModels;
         List<OcrTextBlock>? recognized = sameAsLastRead
             ? [.. state.LastRead]
             : await _ocr.TryRecognizeAsync(
-                frame, sourceLanguage, primarySize, token, region.Profile, region.Orientation);
+                frame, sourceLanguage, primarySize, token, region.Profile, region.Orientation, highPriority);
         if (recognized is null)
         {
             state.Dialogue.RecognitionUnavailable();
@@ -1105,7 +1117,7 @@ public sealed class RealtimeTranslationSession
                 Log.Warn(
                     "Realtime region {Region} skipped a poll: all {Slots} recognition slots busy; " +
                     "further skips logged at Debug",
-                    region.Id, OcrService.ConcurrentRecognitions);
+                    region.Id, _ocr.ActiveConcurrentRecognitions);
             else
                 Log.Debug("Realtime region {Region} skipped a poll: all recognition slots busy", region.Id);
 
@@ -1158,7 +1170,7 @@ public sealed class RealtimeTranslationSession
             if (recognized.Count > 0) break;
 
             var retried = await _ocr.TryRecognizeAsync(
-                frame, sourceLanguage, retrySize, token, region.Profile, region.Orientation);
+                frame, sourceLanguage, retrySize, token, region.Profile, region.Orientation, highPriority);
             if (retried is null) break;   // no free slot; the next poll can try again
 
             if (rejectsCollapsed)
@@ -1563,6 +1575,33 @@ public sealed class RealtimeTranslationSession
                 missing, sourceLanguage, targetLanguage, apiKey, cancellationToken: token, engine: _provider,
                 context: context);
 
+            if (context is not null)
+            {
+                var refusedIndices = new List<int>();
+                for (int i = 0; i < missing.Count && i < results.Count; i++)
+                {
+                    if (!results[i].Untranslated && OpenAiChatTranslator.IsModelRefusal(results[i].TranslatedText))
+                        refusedIndices.Add(i);
+                }
+
+                if (refusedIndices.Count > 0)
+                {
+                    var refusedBlocks = refusedIndices.Select(i => missing[i]).ToList();
+                    try
+                    {
+                        var (retried, _) = await _translation.TranslateAsync(
+                            refusedBlocks, sourceLanguage, targetLanguage, apiKey, cancellationToken: token,
+                            engine: _provider, context: null);
+                        for (int k = 0; k < refusedIndices.Count && k < retried.Count; k++)
+                            results[refusedIndices[k]] = retried[k];
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException || !token.IsCancellationRequested)
+                    {
+                        Log.Warn(ex, "Realtime refusal retry without context failed");
+                    }
+                }
+            }
+
             _translationCache.ClearIfOverLimit(TranslationCacheLimit, generation);
 
             // Providers answer in request order; pair defensively anyway so a short reply degrades
@@ -1575,7 +1614,7 @@ public sealed class RealtimeTranslationSession
             var round = new List<TranslationPair>();
             for (int i = 0; i < missing.Count && i < results.Count; i++)
             {
-                if (results[i].Untranslated) continue;
+                if (results[i].Untranslated || OpenAiChatTranslator.IsModelRefusal(results[i].TranslatedText)) continue;
                 _translationCache.Set(cacheKeyPrefix + missing[i].Text, results[i].TranslatedText, generation);
                 round.Add(new TranslationPair(missing[i].Text, results[i].TranslatedText));
             }
@@ -1676,7 +1715,7 @@ public sealed class RealtimeTranslationSession
         }
     }
 
-    private sealed class RegionTranslationPump(
+    internal sealed class RegionTranslationPump(
         RealtimeTranslationSession session,
         RealtimeRegion region,
         RealtimeScrollFollow follow,
@@ -1807,9 +1846,28 @@ public sealed class RealtimeTranslationSession
             IReadOnlyList<TranslatedBlock> lines,
             int? generation = null)
         {
-            if (!_order.TryClaim(pass)) return false;
+            var gen = generation ?? session._translationCache.Generation;
+            var subtitleAccumulate = session._subtitleHoldMs > 0
+                && region.Orientation == RealtimeTextOrientation.Horizontal
+                && region.Profile.Layout != RealtimeBlockMode.Panel;
 
-            follow.Publish(pass, lines, generation ?? session._translationCache.Generation);
+            if (subtitleAccumulate && lines.Count == 0)
+            {
+                session.RaiseRegionUpdated(new RealtimeRegionUpdate(region.Id, lines, gen) { Loop = token });
+                Recovered(RealtimeFailureStage.Translate);
+                return true;
+            }
+
+            var isSubtitleLines = subtitleAccumulate && lines.All(line => line.ReadAs != RealtimeBlockMode.Panel && line.Tilt is null);
+            if (!_order.TryClaim(pass))
+            {
+                if (!isSubtitleLines) return false;
+                session.RaiseRegionUpdated(new RealtimeRegionUpdate(region.Id, lines, gen) { Loop = token, IsLate = true });
+                Recovered(RealtimeFailureStage.Translate);
+                return true;
+            }
+
+            follow.Publish(pass, lines, gen);
             // The region shows what it should again, so a translation that failed before is over.
             Recovered(RealtimeFailureStage.Translate);
             return true;

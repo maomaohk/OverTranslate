@@ -453,7 +453,7 @@ public sealed class OpenAiChatTranslator
                 var read = OpenAiAnswer.ReadNumbered(answer, count);
                 for (var k = 0; k < count; k++)
                 {
-                    if (read[k] is not { } translation)
+                    if (read[k] is not { } translation || IsModelRefusal(translation))
                     {
                         again.Add(batch[k]);
                         continue;
@@ -662,6 +662,55 @@ public sealed class OpenAiChatTranslator
     /// Whether <paramref name="message"/> is a batch of one: its answer is read by number first —
     /// see <see cref="OpenAiAnswer.ReadOfOne"/>.
     /// </param>
+    private static readonly string[] RefusalMarkers =
+    [
+        "抱歉,我无法满足该请求",
+        "抱歉,我無法滿足該請求",
+        "抱歉,我无法协助",
+        "抱歉,我無法協助",
+        "抱歉,我不能协助",
+        "抱歉,我不能協助",
+        "我无法满足该请求",
+        "我無法滿足該請求",
+        "无法协助翻译",
+        "無法協助翻譯",
+        "i'm sorry, i can't",
+        "i'm sorry, i cannot",
+        "i am sorry, i can't",
+        "i am sorry, i cannot",
+        "i cannot assist",
+        "i can't assist",
+        "i cannot fulfill",
+        "i can't fulfill",
+        "i cannot help with",
+        "i can't help with",
+    ];
+
+    public static bool IsModelRefusal(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+
+        var normalized = text.Trim()
+            .Replace('\u2019', '\'')
+            .Replace('\u2018', '\'')
+            .Replace('，', ',')
+            .Replace(", ", ",")
+            .ToLowerInvariant();
+        var spaced = text.Trim()
+            .Replace('\u2019', '\'')
+            .Replace('\u2018', '\'')
+            .Replace('，', ',')
+            .ToLowerInvariant();
+
+        foreach (var marker in RefusalMarkers)
+        {
+            if (normalized.Contains(marker, StringComparison.Ordinal) ||
+                spaced.Contains(marker, StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
     private async Task<string> SegmentAsync(
         string message, string text, OpenAiChatRequest request, CancellationToken token, bool ofOne = false)
     {
@@ -669,7 +718,9 @@ public sealed class OpenAiChatTranslator
         var translation = ofOne
             ? OpenAiAnswer.ReadOfOne(answer, text, request.Prompt.IsDefault)
             : request.Prompt.IsDefault ? OpenAiAnswer.Read(answer, text) : StripThinking(answer);
-        return translation is { Length: > 0 } ? translation : throw new OpenAiChatException(OpenAiChatFailure.NoTranslation);
+        if (translation is not { Length: > 0 } || IsModelRefusal(translation))
+            throw new OpenAiChatException(OpenAiChatFailure.NoTranslation);
+        return translation;
     }
 
     /// <summary>

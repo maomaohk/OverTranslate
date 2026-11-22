@@ -160,6 +160,66 @@ public class RealtimeSubtitleHistoryTests
         finally { window.Close(); }
     });
 
+    [Fact]
+    public void SubtitleMode_DeduplicatesPunctuationJitter_TypewriterGrowth_EarlierQueue_AndMultiBlockOverlap() => OnSta(() =>
+    {
+        var window = CreateLoadedWindow(height: 300, mode: RealtimeBlockMode.Subtitle, subtitleHoldMs: 3000, subtitleMaxHistory: 3);
+        try
+        {
+            // 1. Punctuation/whitespace variation & same OriginalText updates tail in place
+            window.SetLines([new TranslatedBlock("おはよう。", "早上好！", new Rect(40, 220, 520, 36))]);
+            window.SetLines([new TranslatedBlock("おはよう", "早 上 好。", new Rect(40, 220, 520, 36))]);
+            Assert.Equal(["早 上 好。"], RenderedTexts(window).Select(TextOf));
+
+            // 2. Typewriter growth updates tail in place instead of stacking partial + full sentence
+            window.SetLines([new TranslatedBlock("今日はどこへ", "今天要去哪里", new Rect(40, 220, 520, 36))]);
+            window.SetLines([new TranslatedBlock("今日はどこへ行くの？", "今天到底要去哪里玩呢？", new Rect(40, 220, 520, 36))]);
+            Assert.Equal(["早 上 好。", "今天到底要去哪里玩呢？"], RenderedTexts(window).Select(TextOf));
+
+            // 3. Returning to an earlier sentence already in queue moves/refreshes instead of duplicating
+            window.SetLines([new TranslatedBlock("おはよう", "早上好", new Rect(40, 220, 520, 36))]);
+            Assert.Equal(["今天到底要去哪里玩呢？", "早上好"], RenderedTexts(window).Select(TextOf));
+
+            // 4. Multi-block overlap ([A] -> [A, B]) & intra-frame duplicate block dedup
+            window.SetLines([
+                new TranslatedBlock("おはよう", "早上好", new Rect(40, 180, 520, 36)),
+                new TranslatedBlock("おはよう", "早上好！", new Rect(40, 180, 520, 36)),
+                new TranslatedBlock("いい天気", "天气真好", new Rect(40, 220, 520, 36)),
+            ]);
+            Assert.Equal(["今天到底要去哪里玩呢？", "早上好", "天气真好"], RenderedTexts(window).Select(TextOf));
+
+            // 5. Same speaker name across two distinct lines must NOT falsely collapse
+            window.Clear();
+            window.SetLines([
+                new TranslatedBlock("アリス", "爱丽丝", new Rect(40, 180, 120, 36)),
+                new TranslatedBlock("こんにちは", "你好呀", new Rect(40, 220, 520, 36)),
+            ]);
+            window.SetLines([
+                new TranslatedBlock("アリス", "爱丽丝", new Rect(40, 180, 120, 36)),
+                new TranslatedBlock("さようなら", "再见了", new Rect(40, 220, 520, 36)),
+            ]);
+            Assert.Equal(["爱丽丝", "你好呀", "爱丽丝", "再见了"], RenderedTexts(window).Select(TextOf));
+        }
+        finally { window.Close(); }
+    });
+
+    [Fact]
+    public void LateSubtitle_InsertsAboveNewerWithoutOverwriting_AndRespectsDeduplication() => OnSta(() =>
+    {
+        var window = CreateLoadedWindow(height: 300, mode: RealtimeBlockMode.Subtitle, subtitleHoldMs: 3000, subtitleMaxHistory: 3);
+        try
+        {
+            window.SetLines([Line("第二句")]);
+            window.SetLines([Line("迟到的第一句")], isLate: true);
+            Assert.Equal(["迟到的第一句", "第二句"], RenderedTexts(window).Select(TextOf));
+
+            // Duplicate late arrival does not add again
+            window.SetLines([Line("迟到的第一句")], isLate: true);
+            Assert.Equal(["迟到的第一句", "第二句"], RenderedTexts(window).Select(TextOf));
+        }
+        finally { window.Close(); }
+    });
+
     private static void OnSta(Action action)
     {
         Exception? error = null;

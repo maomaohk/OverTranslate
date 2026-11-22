@@ -744,6 +744,38 @@ public class OpenAiChatProtocolTests
     }
 
     [Theory]
+    [InlineData("抱歉，我无法满足该请求", true)]
+    [InlineData("抱歉，我無法協助處理這個請求", true)]
+    [InlineData("I’m sorry, I can’t assist with that.", true)]
+    [InlineData("I cannot fulfill this request.", true)]
+    [InlineData("早上好！", false)]
+    public void IsModelRefusal_DetectsCommonSafetyRefusals(string text, bool expected)
+    {
+        Assert.Equal(expected, OpenAiChatTranslator.IsModelRefusal(text));
+    }
+
+    [Fact]
+    public async Task RefusalWithContext_RetriesAloneWithoutContext_AndDropsPersistentRefusal()
+    {
+        var server = new OpenAiFakeServer
+        {
+            Answer = text => text switch
+            {
+                "Kill" => "抱歉，我无法满足该请求",
+                _ => $"譯:{text}",
+            },
+        };
+        using var http = new HttpClient(server);
+
+        var outcomes = await new OpenAiChatTranslator(http).TranslateAsync(
+            ["Map", "Kill"], Request(), new OpenAiChatContext([new("前", "之前")]));
+
+        Assert.Equal("譯:Map", outcomes[0].Translation);
+        Assert.False(outcomes[1].Translated);
+        Assert.Contains(server.Requests, r => r.Text == "Kill" && r.Message == Prompt.Build("Kill"));
+    }
+
+    [Theory]
     [InlineData("""not json""", OpenAiChatFailure.Unparsable)]
     [InlineData("""{"choices":[]}""", OpenAiChatFailure.Unparsable)]
     [InlineData("""{"choices":[{"message":{"content":""}}]}""", OpenAiChatFailure.NoTranslation)]

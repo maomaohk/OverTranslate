@@ -85,9 +85,11 @@ internal sealed class OnnxOcrEngine : IOcrEngine
     /// <inheritdoc cref="InferenceSlots"/>
     internal static int ConcurrentRecognitions => InferenceSlots;
 
+    internal int ActiveSlots => Volatile.Read(ref _inferenceGate).MaxSlots;
+
     private readonly object _sync = new();
     // Admits a bounded number of concurrent inferences; see RecognizeAsync for why it is bounded.
-    private SemaphoreSlim _inferenceGate = new(InferenceSlots, InferenceSlots);
+    private PriorityInferenceGate _inferenceGate = new(InferenceSlots);
     private readonly System.Threading.Timer _idleReleaseTimer;
     private RapidOcrRuntime? _current;
     // Written under _sync; volatile so the UI thread can ask what is loaded without waiting out a
@@ -178,7 +180,7 @@ internal sealed class OnnxOcrEngine : IOcrEngine
             _configVersion++;
 
             var slots = useGpu ? 1 : InferenceSlots;
-            Volatile.Write(ref _inferenceGate, new SemaphoreSlim(slots, slots));
+            Volatile.Write(ref _inferenceGate, new PriorityInferenceGate(slots));
 
             if (_inUse == 0)
                 DisposeCurrentRuntime();
@@ -220,7 +222,15 @@ internal sealed class OnnxOcrEngine : IOcrEngine
         Bitmap bitmap,
         string sourceLanguage,
         CancellationToken cancellationToken = default,
-        bool verticalText = false)
+        bool verticalText = false) =>
+        RecognizeAsync(bitmap, sourceLanguage, cancellationToken, verticalText, highPriority: false);
+
+    internal Task<List<OcrTextBlock>> RecognizeAsync(
+        Bitmap bitmap,
+        string sourceLanguage,
+        CancellationToken cancellationToken,
+        bool verticalText,
+        bool highPriority)
     {
         if (!OcrLanguageRouter.IsSupported(sourceLanguage))
             throw new NotSupportedException(OcrLanguageRouter.GetUnsupportedLanguageMessage(sourceLanguage));
@@ -228,17 +238,9 @@ internal sealed class OnnxOcrEngine : IOcrEngine
         var gate = Volatile.Read(ref _inferenceGate);
         return Task.Run(async () =>
         {
-            // Bounded, not unlimited. Each inference already uses ThreadCount threads, so past the
-            // slot count concurrent passes only split the same cores between themselves: overlapping
-            // captures (frame it wrong, Esc, frame again) used to pile up that way and starve the
-            // one the user was actually waiting for.
-            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await gate.AcquireAsync(highPriority, cancellationToken).ConfigureAwait(false);
             try
             {
-                // Checked after the gate, not before: by the time an abandoned request reaches the
-                // front of the queue its session is usually long gone, and bailing out here costs
-                // nothing at all. Inference itself cannot be interrupted, so this is the last point
-                // where giving up is still free.
                 cancellationToken.ThrowIfCancellationRequested();
 
                 return RecognizeCore(bitmap, sourceLanguage, verticalText: verticalText);
@@ -255,17 +257,24 @@ internal sealed class OnnxOcrEngine : IOcrEngine
         string sourceLanguage,
         int? maxDetectSize = null,
         CancellationToken cancellationToken = default,
-        bool verticalText = false)
+        bool verticalText = false) =>
+        TryRecognizeAsync(bitmap, sourceLanguage, maxDetectSize, cancellationToken, verticalText, highPriority: false);
+
+    internal Task<List<OcrTextBlock>?> TryRecognizeAsync(
+        Bitmap bitmap,
+        string sourceLanguage,
+        int? maxDetectSize,
+        CancellationToken cancellationToken,
+        bool verticalText,
+        bool highPriority)
     {
         if (!OcrLanguageRouter.IsSupported(sourceLanguage))
             throw new NotSupportedException(OcrLanguageRouter.GetUnsupportedLanguageMessage(sourceLanguage));
 
         var gate = Volatile.Read(ref _inferenceGate);
-        return Task.Run<List<OcrTextBlock>?>(() =>
+        return Task.Run<List<OcrTextBlock>?>(async () =>
         {
-            // Inside the lambda, not before it: Task.Run with an already-cancelled token never runs
-            // the body, so a slot taken out here would never be given back.
-            if (!gate.Wait(0, cancellationToken))
+            if (!await gate.TryAcquireAsync(highPriority, cancellationToken).ConfigureAwait(false))
                 return null;
 
             try
@@ -283,18 +292,18 @@ internal sealed class OnnxOcrEngine : IOcrEngine
     public IOcrSlot? TryTakeSlot()
     {
         var gate = Volatile.Read(ref _inferenceGate);
-        return gate.Wait(0) ? new Slot(this, gate) : null;
+        return gate.TryTakeImmediate() ? new Slot(this, gate) : null;
     }
 
     public async Task<IOcrSlot> TakeSlotAsync(CancellationToken cancellationToken)
     {
         var gate = Volatile.Read(ref _inferenceGate);
-        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await gate.AcquireAsync(highPriority: false, cancellationToken).ConfigureAwait(false);
         return new Slot(this, gate);
     }
 
     /// <summary>One of <see cref="_inferenceGate"/>'s slots, given back once, when disposed.</summary>
-    private sealed class Slot(OnnxOcrEngine owner, SemaphoreSlim gate) : IOcrSlot
+    private sealed class Slot(OnnxOcrEngine owner, PriorityInferenceGate gate) : IOcrSlot
     {
         private int _released;
 
@@ -475,15 +484,16 @@ internal sealed class OnnxOcrEngine : IOcrEngine
         string sourceLanguage,
         int maxDetectSize,
         float minimumScore,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool highPriority = false)
     {
         if (!OcrLanguageRouter.IsSupported(sourceLanguage))
             throw new NotSupportedException(OcrLanguageRouter.GetUnsupportedLanguageMessage(sourceLanguage));
 
         var gate = Volatile.Read(ref _inferenceGate);
-        return Task.Run<IReadOnlyList<System.Windows.Rect>?>(() =>
+        return Task.Run<IReadOnlyList<System.Windows.Rect>?>(async () =>
         {
-            if (!gate.Wait(0, cancellationToken))
+            if (!await gate.TryAcquireAsync(highPriority, cancellationToken).ConfigureAwait(false))
                 return null;
 
             try
@@ -499,6 +509,131 @@ internal sealed class OnnxOcrEngine : IOcrEngine
                 gate.Release();
             }
         }, cancellationToken);
+    }
+
+    internal sealed class PriorityInferenceGate(int maxSlots)
+    {
+        private readonly object _sync = new();
+        private readonly Queue<Waiter> _highWaiters = new();
+        private readonly Queue<Waiter> _lowWaiters = new();
+        private readonly int _maxSlots = Math.Max(1, maxSlots);
+        private int _active;
+
+        private sealed class Waiter
+        {
+            public readonly TaskCompletionSource<bool> Tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public bool Cancelled;
+        }
+
+        public int MaxSlots => _maxSlots;
+
+        public bool TryTakeImmediate()
+        {
+            lock (_sync)
+            {
+                if (_active >= _maxSlots || _highWaiters.Count > 0) return false;
+                _active++;
+                return true;
+            }
+        }
+
+        public Task AcquireAsync(bool highPriority, CancellationToken cancellationToken)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return Task.FromCanceled(cancellationToken);
+
+            Waiter waiter;
+            lock (_sync)
+            {
+                if (_active < _maxSlots && (highPriority || _highWaiters.Count == 0))
+                {
+                    _active++;
+                    return Task.CompletedTask;
+                }
+
+                waiter = new Waiter();
+                (highPriority ? _highWaiters : _lowWaiters).Enqueue(waiter);
+            }
+
+            return WaitForGrantAsync(waiter, cancellationToken);
+        }
+
+        public Task<bool> TryAcquireAsync(bool highPriority, CancellationToken cancellationToken)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return Task.FromCanceled<bool>(cancellationToken);
+
+            Waiter waiter;
+            lock (_sync)
+            {
+                if (_active < _maxSlots && (highPriority || _highWaiters.Count == 0))
+                {
+                    _active++;
+                    return Task.FromResult(true);
+                }
+
+                if (!highPriority)
+                    return Task.FromResult(false);
+
+                waiter = new Waiter();
+                _highWaiters.Enqueue(waiter);
+            }
+
+            return WaitForGrantBoolAsync(waiter, cancellationToken);
+        }
+
+        private async Task WaitForGrantAsync(Waiter waiter, CancellationToken cancellationToken)
+        {
+            using var reg = cancellationToken.Register(() =>
+            {
+                lock (_sync) waiter.Cancelled = true;
+                waiter.Tcs.TrySetCanceled(cancellationToken);
+            });
+            await waiter.Tcs.Task.ConfigureAwait(false);
+        }
+
+        private async Task<bool> WaitForGrantBoolAsync(Waiter waiter, CancellationToken cancellationToken)
+        {
+            await WaitForGrantAsync(waiter, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+
+        public void Release()
+        {
+            Waiter? next;
+            lock (_sync)
+            {
+                next = DequeueNext(_highWaiters) ?? DequeueNext(_lowWaiters);
+                if (next is null)
+                    _active = Math.Max(0, _active - 1);
+            }
+
+            if (next is not null && !next.Tcs.TrySetResult(true))
+                Release();
+        }
+
+        private static Waiter? DequeueNext(Queue<Waiter> queue)
+        {
+            while (queue.Count > 0)
+            {
+                var candidate = queue.Dequeue();
+                if (!candidate.Cancelled) return candidate;
+            }
+            return null;
+        }
+
+        public void Dispose()
+        {
+            List<Waiter> remaining;
+            lock (_sync)
+            {
+                remaining = [.. _highWaiters, .. _lowWaiters];
+                _highWaiters.Clear();
+                _lowWaiters.Clear();
+            }
+            foreach (var waiter in remaining)
+                waiter.Tcs.TrySetCanceled();
+        }
     }
 
     /// <summary>

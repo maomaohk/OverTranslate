@@ -207,9 +207,18 @@ public partial class RealtimeBlockWindow : Window
     private readonly DispatcherTimer _subtitleExpiryTimer;
     private bool _sourceActive;
 
-    internal sealed class SubtitleHistoryEntry(string keyText, IReadOnlyList<TranslatedBlock> rawLines, DateTime expiresAtUtc)
+    internal sealed class SubtitleHistoryEntry(
+        string keyText,
+        string originalKeyText,
+        IReadOnlyList<string> normalizedSegments,
+        IReadOnlyList<string> normalizedOriginalSegments,
+        IReadOnlyList<TranslatedBlock> rawLines,
+        DateTime expiresAtUtc)
     {
-        public string KeyText { get; } = keyText;
+        public string KeyText { get; set; } = keyText;
+        public string OriginalKeyText { get; set; } = originalKeyText;
+        public IReadOnlyList<string> NormalizedSegments { get; set; } = normalizedSegments;
+        public IReadOnlyList<string> NormalizedOriginalSegments { get; set; } = normalizedOriginalSegments;
         public IReadOnlyList<TranslatedBlock> RawLines { get; set; } = rawLines;
         public IReadOnlyList<TranslatedBlock>? SettledLines { get; set; }
         public DateTime ExpiresAtUtc { get; set; } = expiresAtUtc;
@@ -408,13 +417,14 @@ public partial class RealtimeBlockWindow : Window
         Marker.Visibility = Visibility.Visible;
     }
 
-    public void SetLines(IReadOnlyList<TranslatedBlock> lines)
+    public void SetLines(IReadOnlyList<TranslatedBlock> lines, bool isLate = false)
     {
         if (_subtitleHoldMs > 0 && _orientation == RealtimeTextOrientation.Horizontal && _mode != RealtimeBlockMode.Panel)
         {
             var visible = lines.Where(line => !line.Hidden && !string.IsNullOrWhiteSpace(line.TranslatedText)).ToList();
             if (visible.Count == 0)
             {
+                if (isLate) return;
                 if (_mode == RealtimeBlockMode.Subtitle || _subtitleHistory.Count > 0)
                 {
                     var wasSourceActive = _sourceActive;
@@ -430,25 +440,74 @@ public partial class RealtimeBlockWindow : Window
             }
             else if (visible.All(block => block.Tilt is null && (_mode == RealtimeBlockMode.Auto ? block.ReadAs != RealtimeBlockMode.Panel : true)))
             {
+                var (effectiveLines, dedupedVisible) = DeduplicateVisibleBlocks(lines, visible);
                 var expiresAt = DateTime.UtcNow.AddMilliseconds(_subtitleHoldMs);
-                var keyText = string.Join('\n', visible.Select(line => line.TranslatedText));
-                if (_subtitleHistory.Count > 0 && string.Equals(_subtitleHistory[^1].KeyText, keyText, StringComparison.Ordinal))
+                var incoming = BuildSubtitleHistoryEntry(dedupedVisible, effectiveLines, expiresAt);
+
+                if (isLate)
                 {
-                    _subtitleHistory[^1].ExpiresAtUtc = expiresAt;
+                    for (int i = _subtitleHistory.Count - 1; i >= 0; i--)
+                    {
+                        if (MatchesSubtitleHistory(_subtitleHistory[i], incoming, isTail: i == _subtitleHistory.Count - 1))
+                        {
+                            _subtitleHistory[i].ExpiresAtUtc = expiresAt;
+                            return;
+                        }
+                    }
+
+                    if (_subtitleHistory.Count == 0)
+                    {
+                        _sourceActive = false;
+                        _subtitleHistory.Add(incoming);
+                    }
+                    else if (_subtitleMaxHistory > 1)
+                    {
+                        _subtitleHistory.Insert(_subtitleHistory.Count - 1, incoming);
+                        while (_subtitleHistory.Count > _subtitleMaxHistory)
+                            _subtitleHistory.RemoveAt(0);
+                    }
+                    else
+                    {
+                        return;
+                    }
+
+                    _subtitleExpiryTimer.Start();
+                    if (_isLoaded)
+                    {
+                        Rebuild();
+                        UpdateNaturalRefreshTimer();
+                    }
+                    return;
+                }
+
+                if (_subtitleHistory.Count > 0 && MatchesSubtitleHistory(_subtitleHistory[^1], incoming, isTail: true))
+                {
+                    var tail = _subtitleHistory[^1];
+                    tail.ExpiresAtUtc = expiresAt;
                     _sourceActive = true;
-                    if (_isLoaded && LooksIdentical(_lines, lines)) return;
-                    _subtitleHistory[^1].RawLines = lines;
-                    _subtitleHistory[^1].SettledLines = null;
+                    if (_isLoaded && LooksIdentical(_lines, effectiveLines)) return;
+                    tail.KeyText = incoming.KeyText;
+                    tail.OriginalKeyText = incoming.OriginalKeyText;
+                    tail.NormalizedSegments = incoming.NormalizedSegments;
+                    tail.NormalizedOriginalSegments = incoming.NormalizedOriginalSegments;
+                    tail.RawLines = effectiveLines;
+                    tail.SettledLines = null;
                 }
                 else
                 {
+                    for (int i = _subtitleHistory.Count - 2; i >= 0; i--)
+                    {
+                        if (MatchesSubtitleHistory(_subtitleHistory[i], incoming, isTail: false))
+                            _subtitleHistory.RemoveAt(i);
+                    }
+
                     _sourceActive = true;
-                    _subtitleHistory.Add(new SubtitleHistoryEntry(keyText, lines, expiresAt));
+                    _subtitleHistory.Add(incoming);
                     while (_subtitleHistory.Count > _subtitleMaxHistory)
                         _subtitleHistory.RemoveAt(0);
                 }
 
-                _lines = lines;
+                _lines = effectiveLines;
                 _subtitleExpiryTimer.Start();
                 if (_isLoaded)
                 {
@@ -459,6 +518,7 @@ public partial class RealtimeBlockWindow : Window
             }
             else
             {
+                if (isLate) return;
                 ClearSubtitleHistory();
             }
         }
@@ -515,6 +575,97 @@ public partial class RealtimeBlockWindow : Window
         _subtitleHistory.Clear();
         _sourceActive = false;
         _subtitleExpiryTimer.Stop();
+    }
+
+    private static (IReadOnlyList<TranslatedBlock> EffectiveLines, List<TranslatedBlock> DedupedVisible) DeduplicateVisibleBlocks(
+        IReadOnlyList<TranslatedBlock> lines, List<TranslatedBlock> visible)
+    {
+        if (visible.Count <= 1) return (lines, visible);
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var dedupedVisible = new List<TranslatedBlock>(visible.Count);
+        var dropped = new HashSet<TranslatedBlock>(ReferenceEqualityComparer.Instance);
+        foreach (var block in visible)
+        {
+            var norm = NormalizeSubtitleText(block.TranslatedText);
+            if (norm.Length > 0 && !seen.Add(norm))
+                dropped.Add(block);
+            else
+                dedupedVisible.Add(block);
+        }
+
+        if (dropped.Count == 0) return (lines, visible);
+        var effective = lines.Where(line => !dropped.Contains(line)).ToList();
+        return (effective, dedupedVisible);
+    }
+
+    private static SubtitleHistoryEntry BuildSubtitleHistoryEntry(
+        List<TranslatedBlock> visible, IReadOnlyList<TranslatedBlock> effectiveLines, DateTime expiresAtUtc)
+    {
+        var transSegs = visible.Select(line => NormalizeSubtitleText(line.TranslatedText)).Where(s => s.Length > 0).ToArray();
+        var origSegs = visible.Select(line => NormalizeSubtitleText(line.OriginalText)).Where(s => s.Length > 0).ToArray();
+        return new SubtitleHistoryEntry(
+            string.Concat(transSegs),
+            string.Concat(origSegs),
+            transSegs,
+            origSegs,
+            effectiveLines,
+            expiresAtUtc);
+    }
+
+    private static bool MatchesSubtitleHistory(SubtitleHistoryEntry existing, SubtitleHistoryEntry incoming, bool isTail)
+    {
+        if (IsSameSubtitleText(existing.KeyText, incoming.KeyText, allowPrefix: isTail))
+            return true;
+        if (IsSameSubtitleText(existing.OriginalKeyText, incoming.OriginalKeyText, allowPrefix: isTail))
+            return true;
+
+        if (existing.NormalizedSegments.Count != incoming.NormalizedSegments.Count &&
+            existing.NormalizedSegments.Count > 0 && incoming.NormalizedSegments.Count > 0)
+        {
+            var (smaller, larger) = existing.NormalizedSegments.Count < incoming.NormalizedSegments.Count
+                ? (existing.NormalizedSegments, incoming.NormalizedSegments)
+                : (incoming.NormalizedSegments, existing.NormalizedSegments);
+            if (smaller.All(seg => larger.Contains(seg, StringComparer.Ordinal)))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsSameSubtitleText(string a, string b, bool allowPrefix)
+    {
+        if (a.Length == 0 || b.Length == 0) return false;
+        if (string.Equals(a, b, StringComparison.Ordinal)) return true;
+
+        int minLen = Math.Min(a.Length, b.Length);
+        if (TextSimilarity.IsSameContent(a, b)) return true;
+        if (allowPrefix && minLen >= 4 &&
+            (a.StartsWith(b, StringComparison.Ordinal) || b.StartsWith(a, StringComparison.Ordinal)))
+            return true;
+
+        return false;
+    }
+
+    private static string NormalizeSubtitleText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return "";
+
+        var sb = new System.Text.StringBuilder(text.Length);
+        foreach (var ch in text)
+        {
+            if (char.IsWhiteSpace(ch) || char.IsPunctuation(ch) || ch is '~' or '～')
+                continue;
+            sb.Append(char.ToLowerInvariant(ch));
+        }
+        if (sb.Length > 0) return sb.ToString();
+
+        foreach (var ch in text)
+        {
+            if (!char.IsWhiteSpace(ch))
+                sb.Append(char.ToLowerInvariant(ch));
+        }
+        return sb.ToString();
     }
 
     internal void PruneExpiredSubtitles(DateTime utcNow)

@@ -112,6 +112,8 @@ public sealed record RealtimeRegionUpdate(
     /// </summary>
     public CancellationToken Loop { get; init; }
 
+    public bool IsLate { get; init; }
+
     /// <summary>
     /// Whether these lines may still be drawn: they belong to the screen as it is now
     /// (<paramref name="visibleGeneration"/>), and the loop that drew them has not been stopped since.

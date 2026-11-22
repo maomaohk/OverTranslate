@@ -202,12 +202,13 @@ public class OcrService : IDisposable
         int? maxDetectSize = null,
         CancellationToken cancellationToken = default,
         Realtime.RealtimeBlockMode mode = Realtime.RealtimeBlockMode.Panel,
-        Realtime.RealtimeTextOrientation orientation = Realtime.RealtimeTextOrientation.Horizontal) =>
+        Realtime.RealtimeTextOrientation orientation = Realtime.RealtimeTextOrientation.Horizontal,
+        bool highPriority = false) =>
         TryRecognizeAsync(
             bitmap, sourceLanguage, maxDetectSize, cancellationToken,
-            Realtime.ResolvedProfile.ForLayout(mode), orientation);
+            Realtime.ResolvedProfile.ForLayout(mode), orientation, highPriority);
 
-    /// <inheritdoc cref="TryRecognizeAsync(Bitmap, string, int?, CancellationToken, Realtime.RealtimeBlockMode, Realtime.RealtimeTextOrientation)"/>
+    /// <inheritdoc cref="TryRecognizeAsync(Bitmap, string, int?, CancellationToken, Realtime.RealtimeBlockMode, Realtime.RealtimeTextOrientation, bool)"/>
     /// <param name="profile">
     /// The live region's mode, as the pipeline runs it. Read only by text written across: the
     /// column path groups on its own figures whatever the mode says.
@@ -218,7 +219,8 @@ public class OcrService : IDisposable
         int? maxDetectSize,
         CancellationToken cancellationToken,
         Realtime.ResolvedProfile profile,
-        Realtime.RealtimeTextOrientation orientation = Realtime.RealtimeTextOrientation.Horizontal)
+        Realtime.RealtimeTextOrientation orientation = Realtime.RealtimeTextOrientation.Horizontal,
+        bool highPriority = false)
     {
         if (!OcrLanguageRouter.IsSupported(sourceLanguage))
             throw new NotSupportedException(OcrLanguageRouter.GetUnsupportedLanguageMessage(sourceLanguage));
@@ -232,8 +234,10 @@ public class OcrService : IDisposable
             return columns is null ? null : TiltedOverlap.Level(columns);
         }
 
-        var blocks = await engine.TryRecognizeAsync(
-            bitmap, OcrLanguageRouter.Normalize(sourceLanguage), maxDetectSize, cancellationToken);
+        var normalizedLang = OcrLanguageRouter.Normalize(sourceLanguage);
+        var blocks = engine is OnnxOcrEngine onnx
+            ? await onnx.TryRecognizeAsync(bitmap, normalizedLang, maxDetectSize, cancellationToken, verticalText: false, highPriority: highPriority)
+            : await engine.TryRecognizeAsync(bitmap, normalizedLang, maxDetectSize, cancellationToken);
 
         if (blocks is null)
             return null;
@@ -312,7 +316,8 @@ public class OcrService : IDisposable
         string sourceLanguage,
         int maxDetectSize,
         float minimumScore,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool highPriority = false)
     {
         if (_engineMode == Models.AppSettings.OcrEngineWindows)
         {
@@ -323,7 +328,7 @@ public class OcrService : IDisposable
 
         return _onnxEngine.TryDetectTextAsync(
             bitmap, OcrLanguageRouter.Normalize(sourceLanguage), maxDetectSize, minimumScore,
-            cancellationToken);
+            cancellationToken, highPriority);
     }
 
     /// <param name="decisions">
@@ -649,6 +654,9 @@ public class OcrService : IDisposable
     /// many slots there were, which is the number that makes the refusal mean anything.
     /// </summary>
     public static int ConcurrentRecognitions => OnnxOcrEngine.ConcurrentRecognitions;
+
+    internal int ActiveConcurrentRecognitions =>
+        ActiveEngine is OnnxOcrEngine onnx ? onnx.ActiveSlots : ConcurrentRecognitions;
 
     public void Dispose()
     {
